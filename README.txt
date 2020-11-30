@@ -1,7 +1,7 @@
 # Predicting Ungauged Basins for Daily Unimpaired Flows
 A record of data gathering, processing, modelling with differnet loss functions, and resampling methods for the predicting ungauged basins (PUB) problem. All code was written in R and uses many libraries (see citations in .rmd files).
 
-# Installation
+## Installation
 Install R and Rstudio. Clone or donwload this repository. Open Rstudio and create a R Project in the cloned directory. Open the .Rmd files in the R Project environment. Install all missing libraries with install.packages() in the Rstudio console, e.g.:  
 ```bash
 install.packages("ratser")
@@ -9,7 +9,7 @@ install.packages("ratser")
 
 No GPU is required for running keras and training neural networks.
 
-# Usage 
+## Usage 
 All code used to process data and for modelling is in *.Rmd files. 
 
 You will need an "Input Data" folder to run "ch1 data prep.Rmd." This folder was too large to host on GitHub. Email me at white.elaheh@gmail.com for these files. 
@@ -24,11 +24,11 @@ Once moddf.rds is made from running "ch1 data prep.Rmd", other *.Rmd files can b
 
 "ml overview.pptx" is a slideshow explaining the concepts behind modeling for PUB. 
 
-# Support 
+## Support 
 Email me at white.elaheh@gmail.com. 
 
-# Roadmap 
+## Roadmap 
 Future work can improve the neural network architecture to include many basin observations as inputs and include a LSTM to take into account the sequential nature of the observations. 
 
-# Project Status 
+## Project Status 
 Development has stopped as of 11/30/2020 
