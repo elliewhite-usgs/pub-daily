@@ -1,0 +1,1203 @@
+---
+title: "lossfunctions"
+author: "Ellie White"
+date: "March 2, 2019"
+output: html_document
+---
+
+Record of how a model will behave given different loss functions on hydrologic data. 
+
+# Contents   
+1.0 Data Gathering
+2.0 Data Transformations
+3.0 Functions
+4.0 Modelling and Resampling
+5.0 LOGO Post Processing
+  5.1 Aggregate Basins
+  5.1 GOF Post Processing
+6.0 Plots
+  6.1 Time Series Visual Fit  
+  6.2 GOF Comparisons
+  6.3 Observed vs. Predicted
+  6.4 Density Plots
+  6.5 Map Plots
+  6.6 Dotcharts
+
+```{r, include=FALSE}
+library(knitr)
+library(formatR)
+opts_chunk$set(
+  fig.width  = 7.5,
+  fig.height = 7.5,
+  collapse   = TRUE,
+  tidy       = FALSE
+)
+```
+
+```{r citations}
+# cite R 
+toBibtex(citation())
+
+# cite R studio
+RStudio.Version()
+
+# cite packages
+citethese <- c("lattice", "grid", "caret", "xtable")
+for(i in seq_along(citethese)){
+  x <- citation(citethese[i])
+  print(toBibtex(x))
+}
+
+remove(citethese)
+sessionInfo()
+```
+
+# 1.0 Data Gathering
+```{r data_gathering} 
+set.seed(3232019)
+moddf <- readRDS('Intermediary Data/moddf.rds')
+```
+
+```{r data_gathering_extra}
+# some helpful dataframes, may come in handy later for post processing
+sptdf <- df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
+
+sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,]
+
+coordinates(sptdf) <- ~LONGITUDE + LATITUDE
+proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
+
+library(rgdal)
+library(sp)
+library(raster)
+basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily.shp')
+caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
+cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
+
+# projections used for California
+tealalbers <- crs("+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +datum=NAD83 +units=km +ellps=GRS80")
+albers <- crs("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0")
+
+# transform to all to Albers
+sptdf <- spTransform(sptdf, albers)
+basins <- spTransform(basins, albers)
+caboundary <- spTransform(caboundary, albers)
+cacounties <- spTransform(cacounties, albers)
+
+# join the information on the stations to the SpatialPolygonsDataFrame
+basins@data <- merge(basins@data, sptdf, by="CDEC_ID")
+
+# wide format data
+cdec_fnf_wide <- read.csv('Intermediary Data/cdec_fnf_wide.csv')
+cdec_fnf_wide$DATE <- as.Date(cdec_fnf_wide$DATE, format="%Y-%m-%d")
+cdec_fnf_wide <- cdec_fnf_wide[order(cdec_fnf_wide$DATE),]
+
+# The full records span 1900-01-01 to 1980-09-01, but most records start at 1982, we started PRISM downloads at 2010
+cdec_fnf_wide <- cdec_fnf_wide[cdec_fnf_wide$DATE>="2010-01-01", ]
+```
+
+```{r visuals}
+# colourblind palettes
+# ordered:     black      pink        orange     yellow     green       blue      darkorange  lightblue
+cbpgrey <-  c("#999999", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+```
+
+# 2.0 Data Tranformations
+```{r data_transformations} 
+# none
+```
+
+# 3.0 Functions
+```{r funcstoimport}
+# library(hydroGOF) # this is giving wrong functions, do not load it in make sure the search path is clear
+goffuncs <- list.files("libraries/HydroGOFm/R")
+for(i in 1:length(goffuncs)){
+  source(paste0("libraries/HydroGOFm/R/", goffuncs[i]))
+}
+remove(goffuncs)
+
+search()
+```
+
+# 4.0 Modelling and Resampling
+here are some of the loss functions provided by the R interface to Keras:
+keras::loss_mean_absolute_error()
+keras::loss_mean_absolute_percentage_error()
+keras::loss_mean_squared_error()
+keras::loss_mean_squared_logarithmic_error()
+
+example built in loss functions in python
+def mean_squared_error(y_true, y_pred):
+    return K.mean(K.square(y_pred - y_true), axis=-1)
+
+def mean_squared_logarithmic_error(y_true, y_pred):
+    first_log = K.log(K.clip(y_pred, K.epsilon(), None) + 1.)
+    second_log = K.log(K.clip(y_true, K.epsilon(), None) + 1.)
+    return K.mean(K.square(first_log - second_log), axis=-1)
+
+The original keras function uses the clip operation to make sure that negative values are not passed to the log function, and adding 1 to the clip result makes sure that all log transformed inputs will have non-negative results. We will do something similar here. However, we will use the relu operation rather than the clip operation.
+
+For Asymmetric Functions
+A loss function in keras must accept only 2 arguments: y_true and y_pred, which are the target tensor and model output tensor, correspondingly. But what if we want our loss/metric to depend on other tensors other than these two? To accomplish this, we will need to use "function closure." We will create a loss function (with whichever arguments we like) which returns a function of y_true and y_pred.
+
+I would like to pass a vector that is outside of the training data, but the same length as the training data, to a custom loss function. The vector represents a post-prediction funnel (weights) that an observation has to pass through before they can yield (one or zero). Obviously, I can't use this funnel as a feature, but I would like to use it in a loss function. This funnel designates each observation and prediction pair as a flood or a drought and assigns different pairs of weights to them.
+
+CANNOT have other parameters that y_true, y_pred in the loss function! So, the purpose of the wrapper function is to calculate auxiliary values for the complete loss function. It returns a function which calculates the complete loss given only the input and target output!
+```{r nnmod}
+# # install and set up our environment for deep learning
+# devtools::install_github("rstudio/reticulate")
+# devtools::install_github("rstudio/keras")
+# devtools::install_github("rstudio/tensorflow")
+
+library(keras)
+install_keras(tensorflow = "1.12")
+
+# for normalizing data
+library (caret)
+
+# custom losses
+# the custom loss functions for R need to operate on tensor objects rather than R primitives. In order to perform these operations, you need to get a reference to the backend using backend(). In my system configuration, this returns a reference to tensorflow.
+
+# mean absolute log error
+male <- function(y_true, y_pred){
+  K <- backend()
+  K$mean(K$abs(K$log(K$relu(y_true) + 1) - K$log(K$relu(y_pred) + 1)))
+}
+
+# mean squared absolute log error
+msale <- function(y_true, y_pred){
+  K <- backend()
+  K$mean(K$pow(K$abs(K$log(K$relu(y_true) + 1) - K$log(K$relu(y_pred) + 1)), 2))
+}
+
+mspe <- function(y_true, y_pred){
+  K <- backend()
+  # added a 1 to y_true, because dividing by 0 is a problem. In the cases where y_true=0, the mspe function turns into a simple mse.
+  mod_loss <- K$mean(K$pow((K$flatten(y_pred)-K$flatten(y_true))/K$flatten(y_true+1), 2))
+  return(mod_loss)
+}
+
+wlse <- function(y_true, y_pred, flood_vect, alphad, betad, alphaf, betaf){
+  alpha_vect <- ifelse(flood_vect==0, alphad, alphaf)
+  beta_vect <- ifelse(flood_vect==0, betad, betaf)
+  K <- backend()
+  alpha_vect_cte <- K$constant(alpha_vect, dtype='float32')
+  beta_vect_cte <- K$constant(beta_vect, dtype='float32')
+  alpha_loss <- K$transpose(alpha_vect_cte)*K$cast(K$pow(K$minimum(0, K$flatten(y_pred)-K$flatten(y_true)), 2), dtype='float32')
+  beta_loss <- K$transpose(beta_vect_cte)*K$cast(K$pow(K$maximum(0, K$flatten(y_pred)-K$flatten(y_true)), 2), dtype='float32')
+  mod_loss <- K$sum(alpha_loss + beta_loss)*10^-6
+  return(mod_loss)
+}
+
+wlse_wrapper_stochastic <- custom_metric("wlse", function(y_true, y_pred){
+  wlse(y_true, y_pred, flood_vect=trainsetpvs2[, "FLOOD"], alphad=0.00001, betad=0.00005, alphaf=0.00005, betaf=0.00001)
+})
+
+linexe <- function(y_true, y_pred, flood_vect, phid, phif){
+  phi_vect <- ifelse(flood_vect==0, phid, phif)
+  K <- backend()
+  phi_vect_cte <- K$constant(phi_vect, dtype='float32')
+  exp_loss <- K$exp(K$transpose(phi_vect_cte)*K$cast(K$flatten(10^-6*(y_true-y_pred)), dtype='float32'))
+  lin_loss <- K$transpose(phi_vect_cte)*K$cast(K$flatten(10^-6*(y_true-y_pred)), dtype='float32') + 1
+  # unlike minibatch K$mean works, because we know batch_size=nrow(trainsetpvs)
+  mod_loss <- 10^6*(K$mean(exp_loss-lin_loss)) # added a beta in the beginning
+  # K$get_value(mod_loss)
+  return(mod_loss) 
+}
+
+linexe_wrapper_stochastic <- custom_metric("linexe", function(y_true, y_pred){
+  # make sure phid is positive, and phif is negative
+  linexe(y_true, y_pred, flood_vect=trainsetpvs2[, "FLOOD"], phid=1.0, phif=-1.5)
+})
+
+# need to write a wlse_wrapper_minibatch function if you want to speed up training. For now just use long epochs. 
+
+# example y_true and y_pred to play with
+#y_true=trainsetrv
+#y_pred=trainsetrv*1.1+10000
+#y_pred=y_true*2-rnorm(nrow(trainsetpvs2), 0, 0.01)*20000
+
+nnloss <- function(data, losstype){
+  optimmodel <- results <- modgof <- list()
+  
+  for (k in 1:(length(unique(data$CDEC_ID)))){
+    h <- unique(data$CDEC_ID)[k]
+    testset <- data[data$CDEC_ID==h,]
+    trainset <- data[data$CDEC_ID!=h,]
+    
+    # for symmetric losses: separate into predictor variables and response variable
+    testsetpvs <- as.matrix(testset[,c(10, 13:(ncol(testset)-1))])
+    trainsetpvs <- as.matrix(trainset[,c(10, 13:(ncol(trainset)-1))])
+    testsetrv <- as.matrix(testset$FLOW)
+    trainsetrv <- as.matrix(trainset$FLOW)
+    
+    # for asymmetric losses: designate each observation as a flood:1 or a drought:0 for asymmetric losses
+    floodlvl_mean <- aggregate(PPT~CDEC_ID, data=trainset, FUN=mean)
+    colnames(floodlvl_mean)[2] <- "FLVL_MEAN"
+    trainset <- merge(trainset, floodlvl_mean, by="CDEC_ID")
+    trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0) 
+    trainsetpvs2 <- as.matrix(trainset[,c(10, 13:36, 38)]) 
+    trainsetrv2 <- as.matrix(trainset$FLOW)
+    
+    # normalize the training set on standard deviation, then normalize testset by using mean and SD of training set so no leaks happen
+    scale_par <- preProcess(trainsetpvs, method=c("scale"))
+    trainsetpvs_scaled <- data.frame(predict(scale_par, trainsetpvs))
+    testsetpvs_scaled <- predict(scale_par, testsetpvs) # this should remain a matrix
+    # add in the flood column, since the data wasn't shuffled just columnbind
+    trainsetpvs_scaled2 <- trainsetpvs_scaled
+    trainsetpvs_scaled2$FLOOD <- trainset$FLOOD
+    trainsetpvs_scaled2 <- as.matrix(trainsetpvs_scaled2) # back to matrix form 
+    trainsetpvs_scaled <- as.matrix(trainsetpvs_scaled)
+    
+    # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
+    nnmodel <- keras_model_sequential() %>% # use: "relu", "sigmoid", "softmax"
+      layer_dense(units=64, activation="relu", input_shape=dim(trainsetpvs)[[2]]) %>%
+      layer_dense(units=64, activation="relu") %>%
+      layer_dense(units=1) # number of outputs, here we just want one prediction
+    
+    # first, losses provided by keras
+    if(losstype=="mse"){
+      nnmodel %>% # to compile the model, loss functions are defined here
+        compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
+      nnmodel %>%  # this is to fit the model coefficients
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    if(losstype=="mae"){
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=keras::loss_mean_absolute_error, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    if(losstype=="msle"){ 
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=keras::loss_mean_squared_logarithmic_error, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    if(losstype=="mape"){ 
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=keras::loss_mean_absolute_percentage_error, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    if(losstype=="logcosh"){
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=keras::loss_logcosh, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    # second, custom symmetric losses
+    if(losstype=="mspe"){ 
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=mspe, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    if(losstype=="male"){ # custom mean log absolute error
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=male, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    if(losstype=="msale"){ # custom mean squared log absolute error
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=msale, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    # third, custom asymmetric losses
+    # in fitting, make sure batch_size = nrow(train_x), shuffle = FALSE so that (y_true,y_pred) actually line up to the same observations. We need this because we have flood/drought designations. Also, we cannot have a validation split if the batch_size is now the whole training set.
+    # This is not working inside the function environment, because trainsetpvs2 is only saved inside the this function and not in global, so the wrapper is not able to locate it. So, let's take the easy way out and just take the asymmetric part out of the function and run the code chunk below instead.
+    if(losstype=="wlse"){
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=wlse_wrapper_stochastic, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=1000, batch_size=nrow(trainsetpvs), shuffle=FALSE, verbose=1)
+        predictions <- nnmodel %>% predict(testsetpvs)
+        predictions <- predictions[ , 1] 
+        results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+        modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+
+    if(losstype=="linexe"){
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=linexe_wrapper_stochastic, metrics=c("mae"))
+      nnmodel %>% 
+        fit(trainsetpvs, trainsetrv, epochs=1000, verbose=1, batch_size=nrow(trainsetpvs), shuffle=FALSE)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    # check progress of the loop
+    print(paste0("k=", k, ", Basin=", h))
+  }
+  
+  names_tbd <- rownames(modgof[[1]])
+  modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+  rownames(modgof) <- names_tbd
+  colnames(modgof) <- unique(data$CDEC_ID)
+  list(results=results, gof=modgof)
+}
+
+# nn_logo_mse_results <- nnloss(moddf, "mse")
+# saveRDS(nn_logo_mse_results, file="Output Data/rds/nn_logo_mse_results.RDS")
+# nn_logo_mae_results <- nnloss(moddf, "mae")
+# saveRDS(nn_logo_mae_results, file="Output Data/rds/nn_logo_mae_results.RDS")
+# nn_logo_msle_results <- nnloss(moddf, "msle")
+# saveRDS(nn_logo_msle_results, file="Output Data/rds/nn_logo_msle_results.RDS")
+# nn_logo_mape_results <- nnloss(moddf, "mape")
+# saveRDS(nn_logo_mape_results, file="Output Data/rds/nn_logo_mape_results.RDS")
+# nn_logo_logcosh_results <- nnloss(moddf, "logcosh")
+# saveRDS(nn_logo_logcosh_results, file="Output Data/rds/nn_logo_logcosh_results.RDS")
+# nn_logo_mspe_results <- nnloss(moddf, "mspe")
+# saveRDS(nn_logo_mspe_results, file="Output Data/rds/nn_logo_mspe_results.RDS")
+# nn_logo_male_results <- nnloss(moddf, "male")
+# saveRDS(nn_logo_male_results, file="Output Data/rds/nn_logo_male_results.RDS")
+# nn_logo_msale_results <- nnloss(moddf, "msale")
+# saveRDS(nn_logo_msale_results, file="Output Data/rds/nn_logo_msale_results.RDS")
+
+# not working, run code chunk below instead
+# nn_logo_wlse_results <- nnloss(moddf, "wlse")
+# saveRDS(nn_logo_wlse_results, file="Output Data/rds/nn_logo_wlse_results.RDS")
+# nn_logo_linexe_results <- nnloss(moddf, "linexe")
+# saveRDS(nn_logo_linexe_results, file="Output Data/rds/nn_logo_linexe_results.RDS")
+```
+
+```{r nn_wlse}
+# # function environments not saving trainsetpvs2 for some reason. Let's try outside of the nnloss function
+# optimmodel <- results <- modgof <- list()
+# for (k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+# 
+#   # for symmetric losses: separate into predictor variables and response variable
+#   testsetpvs <- as.matrix(testset[,c(10, 13:(ncol(testset)-1))])
+#   trainsetpvs <- as.matrix(trainset[,c(10, 13:(ncol(trainset)-1))])
+#   testsetrv <- as.matrix(testset$FLOW)
+#   trainsetrv <- as.matrix(trainset$FLOW)
+# 
+#   # for asymmetric losses: designate each observation as a flood:1 or a drought:0 for asymmetric losses
+#   floodlvl_mean <- aggregate(PPT~CDEC_ID, data=trainset, FUN=mean)
+#   colnames(floodlvl_mean)[2] <- "FLVL_MEAN"
+#   trainset <- merge(trainset, floodlvl_mean, by="CDEC_ID")
+#   trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0)
+#   trainsetpvs2 <- as.matrix(trainset[,c(10, 13:36, 39)])
+#   trainsetrv2 <- as.matrix(trainset$FLOW)
+# 
+#   # normalize the training set on standard deviation, then normalize testset by using mean and SD of training set so no leaks happen
+#   scale_par <- preProcess(trainsetpvs, method=c("scale"))
+#   trainsetpvs_scaled <- data.frame(predict(scale_par, trainsetpvs))
+#   testsetpvs_scaled <- predict(scale_par, testsetpvs) # this should remain a matrix
+#   # add in the flood column, since the data wasn't shuffled just columnbind
+#   trainsetpvs_scaled2 <- trainsetpvs_scaled
+#   trainsetpvs_scaled2$FLOOD <- trainset$FLOOD
+#   trainsetpvs_scaled2 <- as.matrix(trainsetpvs_scaled2) # back to matrix form
+#   trainsetpvs_scaled <- as.matrix(trainsetpvs_scaled)
+# 
+#   # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
+#   nnmodel <- keras_model_sequential() %>% # use: "relu", "sigmoid", "softmax"
+#     layer_dense(units=64, activation="relu", input_shape=dim(trainsetpvs)[[2]]) %>%
+#     layer_dense(units=64, activation="relu") %>%
+#     layer_dense(units=1) # number of outputs, here we just want one prediction
+# 
+#   nnmodel %>%
+#     compile(optimizer="rmsprop", loss=wlse_wrapper_stochastic, metrics=c("mae"))
+#   nnmodel %>%
+#     fit(trainsetpvs, trainsetrv, epochs=1000, batch_size=nrow(trainsetpvs), shuffle=FALSE, verbose=1)
+#   predictions <- nnmodel %>% predict(testsetpvs)
+#   predictions <- predictions[ , 1]
+#   results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+#   modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+# }
+# 
+# names_tbd <- rownames(modgof[[1]])
+# modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+# rownames(modgof) <- names_tbd
+# colnames(modgof) <- unique(moddf$CDEC_ID)
+# nn_logo_wlse_results <- list(results=results, gof=modgof)
+# saveRDS(nn_logo_wlse_results, file="Output Data/rds/nn_logo_wlse_results.RDS")
+# 
+# remove(names_tbd)
+# remove(modgof)
+# remove(results)
+```
+
+```{r nn_linexe}
+# # function environments not savind trainsetpvs2 for some reason. Let's try outside of the nnloss function
+# optimmodel <- results <- modgof <- list()
+# for (k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+# 
+#   # for symmetric losses: seperate into predictor variables and response variable
+#   testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+#   trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+#   testsetrv <- as.matrix(testset$FLOW)
+#   trainsetrv <- as.matrix(trainset$FLOW)
+# 
+#   # for asymmetric losses: designate each observation as a flood:1 or a drought:0 for asymmetric losses
+#   floodlvl_mean <- aggregate(PPT~CDEC_ID, data=trainset, FUN=mean)
+#   # floodlvl_median <- aggregate(PPT~CDEC_ID, data=trainset, FUN=median) # let's try median
+#   colnames(floodlvl_mean)[2] <- "FLVL_MEAN"
+#   trainset <- merge(trainset, floodlvl_mean, by="CDEC_ID")
+#   trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0)
+#   trainsetpvs2 <- as.matrix(trainset[,c(10, 13:36, 39)])
+#   trainsetrv2 <- as.matrix(trainset$FLOW)
+# 
+#   # normalize the training set on standard deviation, then normalize testset by using mean and SD of training set so no leaks happen
+#   scale_par <- preProcess(trainsetpvs, method=c("scale"))
+#   trainsetpvs_scaled <- data.frame(predict(scale_par, trainsetpvs))
+#   testsetpvs_scaled <- predict(scale_par, testsetpvs) # this should remain a matrix
+#   # add in the flood column, since the data wasn't shuffled just columnbind
+#   trainsetpvs_scaled2 <- trainsetpvs_scaled
+#   trainsetpvs_scaled2$FLOOD <- trainset$FLOOD
+#   trainsetpvs_scaled2 <- as.matrix(trainsetpvs_scaled2) # back to matrix form
+#   trainsetpvs_scaled <- as.matrix(trainsetpvs_scaled)
+# 
+#   # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
+#   nnmodel <- keras_model_sequential() %>% # use: "relu", "sigmoid", "softmax"
+#     layer_dense(units=64, activation="relu", input_shape=dim(trainsetpvs)[[2]]) %>%
+#     layer_dense(units=64, activation="relu") %>%
+#     layer_dense(units=1) # number of outputs, here we just want one prediction
+# 
+#   nnmodel %>%
+#     compile(optimizer="rmsprop", loss=linexe_wrapper_stochastic, metrics=c("mae"))
+#   nnmodel %>%
+#     fit(trainsetpvs, trainsetrv, epochs=1000, verbose=1, batch_size=nrow(trainsetpvs), shuffle=FALSE)
+#   predictions <- nnmodel %>% predict(testsetpvs)
+#   predictions <- predictions[ , 1]
+#   results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+#   modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+# }
+# 
+# names_tbd <- rownames(modgof[[1]])
+# modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+# rownames(modgof) <- names_tbd
+# colnames(modgof) <- unique(moddf$CDEC_ID)
+# nn_logo_linexe_results <- list(results=results, gof=modgof)
+# saveRDS(nn_logo_linexe_results, file="Output Data/rds/nn_logo_linexe_results.RDS")
+# 
+# remove(names_tbd)
+# remove(modgof)
+# remove(results)
+```
+
+```{r nn_read_model_runs}
+nn_logo_mse_results <- readRDS(file="Output Data/rds/nn_logo_mse_results.RDS")
+nn_logo_mae_results <- readRDS(file="Output Data/rds/nn_logo_mae_results.RDS")
+nn_logo_msle_results <- readRDS(file="Output Data/rds/nn_logo_msle_results.RDS")
+nn_logo_mape_results <- readRDS(file="Output Data/rds/nn_logo_mape_results.RDS")
+nn_logo_logcosh_results <- readRDS(file="Output Data/rds/nn_logo_logcosh_results.RDS")
+nn_logo_mspe_results <- readRDS(file="Output Data/rds/nn_logo_mspe_results.RDS")
+nn_logo_male_results <- readRDS(file="Output Data/rds/nn_logo_male_results.RDS")
+nn_logo_msale_results <- readRDS(file="Output Data/rds/nn_logo_msale_results.RDS")
+nn_logo_wlse_results <- readRDS("Output Data/rds/nn_logo_wlse_results.RDS")
+nn_logo_linexe_results <- readRDS("Output Data/rds/nn_logo_linexe_results.RDS")
+
+# quick check on the results
+mean(unlist(nn_logo_mse_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_mae_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_msle_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_mape_results[["gof"]]["bR2", ]), na.rm=TRUE)
+mean(unlist(nn_logo_logcosh_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_mspe_results[["gof"]]["bR2", ]), na.rm=TRUE)
+mean(unlist(nn_logo_male_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_msale_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_wlse_results[["gof"]]["bR2", ]))
+mean(unlist(nn_logo_linexe_results[["gof"]]["bR2", ]))
+```
+
+# 5.0 LOGO Post Processing 
+```{r data_results_df}
+# make a copy of the original dataframes to add the results to
+results <- moddf
+```
+
+## 5.1 Aggregate Basins
+```{r post_processing_logo}
+pp_results <- function(resultsls, resultsdf, modeltype, losstype){
+  results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+  if(modeltype=="nn"){
+    nsubsetting <- results_unlisted$nforstitch
+    }
+  if(modeltype=="lm"){
+    nsubsetting <- as.numeric(rownames(results_unlisted))
+    }else{paste0("not valid model type!")}
+  results_unlisted <- results_unlisted[order(nsubsetting), ]
+  resultsdf <- cbind(resultsdf, FIT=results_unlisted$pred)
+  resultsdf$RES <- resultsdf$FIT-resultsdf$FLOW # this is pred - obs
+  colnames(resultsdf)[ncol(resultsdf)-1] <- paste0(toupper(modeltype), "_", toupper(losstype), "FIT")
+  colnames(resultsdf)[ncol(resultsdf)] <- paste0(toupper(modeltype), "_", toupper(losstype), "RES")
+  resultsdf
+}
+
+# just going to look at NN now
+results <- pp_results(nn_logo_mse_results, results, "nn", "mse")
+results <- pp_results(nn_logo_mae_results, results, "nn", "mae")
+results <- pp_results(nn_logo_msle_results, results, "nn", "msle")
+results <- pp_results(nn_logo_mape_results, results, "nn", "mape")
+results <- pp_results(nn_logo_logcosh_results, results, "nn", "logcosh")
+results <- pp_results(nn_logo_mspe_results, results, "nn", "mspe")
+results <- pp_results(nn_logo_male_results, results, "nn", "male")
+results <- pp_results(nn_logo_msale_results, results, "nn", "msale")
+results <- pp_results(nn_logo_wlse_results, results, "nn", "wlse")
+results <- pp_results(nn_logo_linexe_results, results, "nn", "linexe")
+```
+
+All results are in results, use this for plotting. 
+
+## 5.3 GOF Post Processing 
+```{r mof_losses_nn}
+gof_nn_mse <- gof(results$NN_MSEFIT, results$FLOW, na.rm=TRUE)
+gof_nn_mae <- gof(results$NN_MAEFIT, results$FLOW, na.rm=TRUE)
+gof_nn_msle <- gof(results$NN_MSLEFIT, results$FLOW, na.rm=TRUE)
+gof_nn_mape <- gof(results$NN_MAPEFIT, results$FLOW, na.rm=TRUE) 
+gof_nn_logcosh <- gof(results$NN_LOGCOSHFIT, results$FLOW, na.rm=TRUE)
+gof_nn_mspe <- gof(results$NN_MSPEFIT, results$FLOW, na.rm=TRUE) 
+gof_nn_male <- gof(results$NN_MALEFIT, results$FLOW, na.rm=TRUE)
+gof_nn_msale <- gof(results$NN_MSALEFIT, results$FLOW, na.rm=TRUE)
+gof_nn_wlse <- gof(results$NN_WLSEFIT, results$FLOW, na.rm=TRUE)
+gof_nn_linexe <- gof(results$NN_LINEXEFIT, results$FLOW, na.rm=TRUE)
+
+gof_nn <- data.frame(cbind(gof_nn_mse, gof_nn_mae, gof_nn_msle, gof_nn_mape, gof_nn_logcosh, gof_nn_mspe, gof_nn_male, gof_nn_msale, gof_nn_wlse, gof_nn_linexe))
+colnames(gof_nn) <- c("MSE_LOSS", "MAE_LOSS","MSLE_LOSS", "MAPE_LOSS", "LOGCOSH_LOSS", "MSPE_LOSS", "MALE_LOSS", "MSALE_LOSS", "WLSE_LOSS", "LINEXE_LOSS")
+
+# use better labels for plots
+library(Hmisc)
+var_labels <- c(MSE_LOSS="Mean Squared Error", MAE_LOSS="Mean Absolute Error", MSLE_LOSS="Mean Squared Log Error", MAPE_LOSS="Mean Absolute Percentage Error", LOGCOSH_LOSS= "Log Hyperbolic Cosine Error", MSPE_LOSS="Mean Squared Precentage Error", MALE_LOSS="Mean Absolute Log Error", MSALE_LOSS="Mean Squared Log Absolute Error", WLSE_LOSS="Weighted Least Squares Error", LINEXE_LOSS="Linear Exponential Error")
+gof_nn <- Hmisc::upData(gof_nn, labels = var_labels)
+
+# for latex documents, put this in appendix
+library(xtable)
+xtable(data.frame(gof_nn))
+
+# check results
+gof_nn["bR2",]
+```
+
+```{r mof_nn_bybasin}
+gof_nn_mse <- gof_nn_mae <- gof_nn_msle <- gof_nn_mape <- gof_nn_logcosh <- gof_nn_mspe <- gof_nn_male <- gof_nn_msale <- gof_nn_wlse <- gof_nn_linexe <- list()
+for (r in 1:(length(unique(results$CDEC_ID)))){ 
+  # plot time series by basin
+  h <- unique(results$CDEC_ID)[r]
+  resultsdf_sub <- results[results$CDEC_ID==h,]
+  gof_nn_mse[[r]] <- gof(resultsdf_sub$NN_MSEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_mae[[r]] <- gof(resultsdf_sub$NN_MAEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_msle[[r]] <- gof(resultsdf_sub$NN_MSLEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_mape[[r]] <- gof(resultsdf_sub$NN_MAPEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_logcosh[[r]] <- gof(resultsdf_sub$NN_LOGCOSHFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_mspe[[r]] <- gof(resultsdf_sub$NN_MSPEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_male[[r]] <- gof(resultsdf_sub$NN_MALEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_msale[[r]] <- gof(resultsdf_sub$NN_MSALEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_wlse[[r]] <- gof(resultsdf_sub$NN_WLSEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_linexe[[r]] <- gof(resultsdf_sub$NN_LINEXEFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+}
+
+pp_gof_by_basins <- function(gof_list){
+  names_tbd <- rownames(gof_list[[1]])
+  gof_by_basins <- data.frame(matrix(unlist(gof_list), nrow=length(gof_list[[1]]), byrow=FALSE))
+  rownames(gof_by_basins) <- names_tbd
+  colnames(gof_by_basins) <- unique(results$CDEC_ID)
+  return(gof_by_basins)
+}
+
+gof_nn_mse_by_basins <- pp_gof_by_basins(gof_nn_mse)
+gof_nn_mae_by_basins <- pp_gof_by_basins(gof_nn_mae)
+gof_nn_msle_by_basins <- pp_gof_by_basins(gof_nn_msle)
+gof_nn_mape_by_basins <- pp_gof_by_basins(gof_nn_mape)
+gof_nn_logcosh_by_basins <- pp_gof_by_basins(gof_nn_logcosh)
+gof_nn_mspe_by_basins <- pp_gof_by_basins(gof_nn_mspe)
+gof_nn_male_by_basins <- pp_gof_by_basins(gof_nn_male)
+gof_nn_msale_by_basins <- pp_gof_by_basins(gof_nn_msale)
+gof_nn_wlse_by_basins <- pp_gof_by_basins(gof_nn_wlse)
+gof_nn_linexe_by_basins <- pp_gof_by_basins(gof_nn_linexe)
+```
+
+# 6.0 Plots
+## 6.1 Time Series Visual Fit
+```{r tsplots_comp_nn}
+library(reshape2)
+for (r in 1:(length(unique(results$CDEC_ID)))){ 
+  # plot time series by basin
+  h <- unique(results$CDEC_ID)[r]
+  resultsdf_sub <- results[results$CDEC_ID==h,]
+  
+  # convert the units. AREASQM is in square miles, PPT is in mm/day, FLOW is in cfs
+  watershedArea_sqft <- resultsdf_sub$AREASQM[1]*(5280)^2
+  resultsdf_sub$precip_ft <- resultsdf_sub$PPT/10/2.54/12
+  resultsdf_sub$precip_cuft <- resultsdf_sub$precip_ft * watershedArea_sqft
+  resultsdf_sub$precip_cfs <- resultsdf_sub$precip_cuft/24/60/60/25 # arbitrary 25 to get the scale right
+  resultsdf_sub$discharge_cfs <- resultsdf_sub$FLOW # no conversion needed
+  
+  resultsdf_sub$NN_MSEFIT_cfs <- resultsdf_sub$NN_MSEFIT
+  resultsdf_sub$NN_MAEFIT_cfs <- resultsdf_sub$NN_MAEFIT
+  resultsdf_sub$NN_MSLEFIT_cfs <- resultsdf_sub$NN_MSLEFIT
+  resultsdf_sub$NN_MAPEFIT_cfs <- resultsdf_sub$NN_MAPEFIT
+  resultsdf_sub$NN_LOGCOSHFIT_cfs <- resultsdf_sub$NN_LOGCOSHFIT
+  resultsdf_sub$NN_MSPEFIT_cfs <- resultsdf_sub$NN_MSPEFIT
+  resultsdf_sub$NN_MALEFIT_cfs <- resultsdf_sub$NN_MALEFIT
+  resultsdf_sub$NN_MSALEFIT_cfs <- resultsdf_sub$NN_MSALEFIT
+  resultsdf_sub$NN_WLSEFIT_cfs <- resultsdf_sub$NN_WLSEFIT
+  resultsdf_sub$NN_LINEXEFIT_cfs <- resultsdf_sub$NN_LINEXEFIT
+  
+  # remove NAs here?
+  resultsdf_sub <- na.omit(resultsdf_sub)
+  
+  # calculate the range needed to avoid having your hyetograph and hydrograph overlap, try having them overlap cause the graph is hard to read 
+  maxFlow <- max(max(resultsdf_sub$discharge_cfs), 
+                 max(resultsdf_sub$NN_MSEFIT_cfs, na.rm=TRUE), 
+                 max(resultsdf_sub$NN_MAEFIT_cfs, na.rm=TRUE), 
+                 # max(resultsdf_sub$NN_MSLEFIT_cfs, na.rm=TRUE),
+                 # max(resultsdf_sub$NN_MAPEFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_LOGCOSHFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_MSPEFIT_cfs, na.rm=TRUE),
+                 # max(resultsdf_sub$NN_MALEFIT_cfs, na.rm=TRUE), 
+                 # max(resultsdf_sub$NN_MSALEFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_WLSEFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_LINEXEFIT_cfs, na.rm=TRUE))
+  maxRange <- 1*(max(resultsdf_sub$precip_cfs) + maxFlow)
+
+  # create a function to backtransform the axis labels for precipitation, for some reason multiplying it by -1 fixed the labels, kinda hacky but whatever
+  precip_labels <- function(x) {round((-1*x/watershedArea_sqft)*12*24*60*60*25, 0)} # labels in inches/day
+  
+  # melt for ggplot dataframe
+  results_sub_melted <- melt(resultsdf_sub[, c("DATE", "discharge_cfs", "NN_MSEFIT_cfs", "NN_LOGCOSHFIT_cfs",  "NN_MAEFIT_cfs", "NN_MSPEFIT_cfs", "NN_WLSEFIT_cfs", "NN_LINEXEFIT_cfs")], id.var='DATE')
+  
+  # make the plot
+  hydrograph <- ggplot(data = results_sub_melted, 
+                       aes(x = DATE, y=value, col=variable)) + 
+    xlab("")  + 
+    ggtitle(paste0('Basin CDEC ID: ', h)) +
+    
+    # use geom_tile to create the inverted hyetograph. geom_tile has a bug that displays a warning message for height and width, you can ignore it.
+    geom_tile(data=resultsdf_sub, aes(y = -1*(precip_cfs/2-maxRange), # y = the center point of each bar
+              height = precip_cfs,
+              width = 2),
+              fill = cbpblack[8],
+              color = cbpblack[8]) +
+  
+    # plot your discharge data
+    geom_line(aes(linetype=variable)) +
+    scale_linetype_manual(values=c("solid", "dashed", "dotted", "dotdash", "longdash", "twodash", "solid"), labels=c("Observed", "MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"), name="Losses")+
+    scale_colour_manual(name="Losses", values = c(cbpblack[1], cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), labels=c("Observed", "MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE")) +
+    theme_bw()+
+    theme(legend.position="bottom", legend.title = element_blank()) +
+    # create a second axis with sec_axis() and format the labels to display the original precipitation units
+    scale_y_continuous(name = "Discharge (cfs)", sec.axis = sec_axis(trans = ~1*(.-maxRange), name = "Precipitation (in/d)", labels = precip_labels)) # labels are in inches/d
+    
+  png(paste0('Output Data/ts_loss/timeseries_nn_', h, '.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+    print(hydrograph)
+  dev.off()
+}
+```
+
+```{r tsplots_comp_nn2}
+# zoom in
+for (r in 1:(length(unique(results$CDEC_ID)))){ 
+  # plot time series by basin
+  h <- unique(results$CDEC_ID)[r]
+  resultsdf_sub <- results[results$CDEC_ID==h,]
+  resultsdf_sub <- resultsdf_sub[resultsdf_sub$DATE<="2001-10-01", ]
+  
+  # convert the units. AREASQM is in square miles, PPT is in mm/day, FLOW is in cfs
+  watershedArea_sqft <- resultsdf_sub$AREASQM[1]*(5280)^2
+  resultsdf_sub$precip_ft <- resultsdf_sub$PPT/10/2.54/12
+  resultsdf_sub$precip_cuft <- resultsdf_sub$precip_ft * watershedArea_sqft
+  resultsdf_sub$precip_cfs <- resultsdf_sub$precip_cuft/24/60/60/25 # arbitrary 25 to get the scale right
+  resultsdf_sub$discharge_cfs <- resultsdf_sub$FLOW # no conversion needed
+  
+  resultsdf_sub$NN_MSEFIT_cfs <- resultsdf_sub$NN_MSEFIT
+  resultsdf_sub$NN_MAEFIT_cfs <- resultsdf_sub$NN_MAEFIT
+  resultsdf_sub$NN_MSLEFIT_cfs <- resultsdf_sub$NN_MSLEFIT
+  resultsdf_sub$NN_MAPEFIT_cfs <- resultsdf_sub$NN_MAPEFIT
+  resultsdf_sub$NN_LOGCOSHFIT_cfs <- resultsdf_sub$NN_LOGCOSHFIT
+  resultsdf_sub$NN_MSPEFIT_cfs <- resultsdf_sub$NN_MSPEFIT
+  resultsdf_sub$NN_MALEFIT_cfs <- resultsdf_sub$NN_MALEFIT
+  resultsdf_sub$NN_MSALEFIT_cfs <- resultsdf_sub$NN_MSALEFIT
+  resultsdf_sub$NN_WLSEFIT_cfs <- resultsdf_sub$NN_WLSEFIT
+  resultsdf_sub$NN_LINEXEFIT_cfs <- resultsdf_sub$NN_LINEXEFIT
+  
+  # remove NAs here?
+  resultsdf_sub <- na.omit(resultsdf_sub)
+  
+  # calculate the range needed to avoid having your hyetograph and hydrograph overlap, try having them overlap cause the graph is hard to read 
+  maxFlow <- max(max(resultsdf_sub$discharge_cfs), 
+                 max(resultsdf_sub$NN_MSEFIT_cfs, na.rm=TRUE), 
+                 max(resultsdf_sub$NN_MAEFIT_cfs, na.rm=TRUE), 
+                 # max(resultsdf_sub$NN_MSLEFIT_cfs, na.rm=TRUE),
+                 # max(resultsdf_sub$NN_MAPEFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_LOGCOSHFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_MSPEFIT_cfs, na.rm=TRUE),
+                 # max(resultsdf_sub$NN_MALEFIT_cfs, na.rm=TRUE), 
+                 # max(resultsdf_sub$NN_MSALEFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_WLSEFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NN_LINEXEFIT_cfs, na.rm=TRUE))
+  maxRange <- 1*(max(resultsdf_sub$precip_cfs) + maxFlow)
+
+  # create a function to backtransform the axis labels for precipitation, for some reason multiplying it by -1 fixed the labels, kinda hacky but whatever
+  precip_labels <- function(x) {round((-1*x/watershedArea_sqft)*12*24*60*60*25, 0)} # labels in inches/day
+  
+  # melt for ggplot dataframe
+  results_sub_melted <- melt(resultsdf_sub[, c("DATE", "discharge_cfs", "NN_MSEFIT_cfs", "NN_LOGCOSHFIT_cfs",  "NN_MAEFIT_cfs", "NN_MSPEFIT_cfs", "NN_WLSEFIT_cfs", "NN_LINEXEFIT_cfs")], id.var='DATE')
+  
+  # make the plot
+  hydrograph <- ggplot(data = results_sub_melted, 
+                       aes(x = DATE, y=value, col=variable)) + 
+    xlab("")  + 
+    ggtitle(paste0('Basin CDEC ID: ', h)) +
+    
+    # use geom_tile to create the inverted hyetograph. geom_tile has a bug that displays a warning message for height and width, you can ignore it.
+    geom_tile(data=resultsdf_sub, aes(y = -1*(precip_cfs/2-maxRange), # y = the center point of each bar
+              height = precip_cfs,
+              width = 2),
+              fill = cbpblack[8],
+              color = cbpblack[8]) +
+  
+    # plot your discharge data
+    geom_line(aes(linetype=variable)) +
+    scale_linetype_manual(values=c("solid", "dashed", "dotted", "dotdash", "longdash", "twodash", "solid"), labels=c("Observed", "MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"), name="Losses")+
+    scale_colour_manual(name="Losses", values = c(cbpblack[1], cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), labels=c("Observed", "MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE")) +
+    theme_bw()+
+    theme(legend.position="bottom", legend.title = element_blank()) +
+    # create a second axis with sec_axis() and format the labels to display the original precipitation units
+    scale_y_continuous(name = "Discharge (cfs)", sec.axis = sec_axis(trans = ~1*(.-maxRange), name = "Precipitation (in/d)", labels = precip_labels)) # labels are in inches/d
+    
+  png(paste0('Output Data/ts_loss_zoomed/timeseries_nn_', h, '.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+    print(hydrograph)
+  dev.off()
+}
+```
+
+## 6.2 GOF Comparisons
+```{r mof_comp_plots}
+goftablet <- data.frame(t(gof_nn[, c("MSE_LOSS", "LOGCOSH_LOSS", "MAE_LOSS", "MSPE_LOSS", "WLSE_LOSS", "LINEXE_LOSS")]))
+
+png('Output Data/rplot32_gof_bR2.png', width=6.5, height=1.5, units="in", pointsize=8, res=1200)
+  ggplot(goftablet)+
+    geom_point(aes(x = bR2, y = reorder(rownames(goftablet), bR2), color=rownames(goftablet)))+
+    scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+    geom_text(aes(x = bR2, y = reorder(rownames(goftablet), bR2), label=round(bR2, digits=2)), nudge_x = 0.05, size=3)+
+    scale_colour_manual(aesthetics=c("colour"), values=c(cbpblack[2], cbpblack[8], cbpblack[5], cbpblack[6], cbpblack[3], cbpblack[7])) +
+    theme_bw(base_size = 8) +
+    annotate("rect", xmin = 0, xmax = 0.5, ymin = 1, ymax = 6, fill= "grey55", alpha = 0.5) +
+    annotate("rect", xmin = 0.5, xmax = 0.65, ymin = 1, ymax = 6, fill= "grey70", alpha = 0.5) +
+    annotate("rect", xmin = 0.65, xmax = 0.75, ymin = 1, ymax = 6, fill= "grey85", alpha = 0.5) +
+    annotate("rect", xmin = 0.75, xmax = 1.0, ymin = 1, ymax = 6, fill= "grey95", alpha = 0.5) +
+    geom_text(aes(x= 0.25, y=6, label="Unsatisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.575, y=1, label="Satisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.7, y=1, label="Good"), size=3, hjust="center")+
+    geom_text(aes(x= 0.875, y=1, label="Very Good"), size=3, hjust="center")+
+    ylab("") +
+    xlab("Bias-Corrected Coefficient of Determination (-)") +
+    theme(legend.title = element_blank(), legend.position = "none") +
+    guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+dev.off()
+
+# png('Output Data/rplot32_gof_MSE.png', width=6.5, height=1.5, units="in", pointsize=8, res=1200)
+#   ggplot(goftablet)+
+#     geom_point(aes(x = MSE, y = reorder(rownames(goftablet), -MSE), color=rownames(goftablet)))+
+#     scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+#     scale_colour_manual(aesthetics=c("colour"), values=c(cbpblack[2], cbpblack[8], cbpblack[5], cbpblack[6], cbpblack[3], cbpblack[7])) +
+#     theme_bw(base_size = 8) +
+#     ylab("") +
+#     xlab("Mean Squared Error (cfs^2)") +
+#     theme(legend.title = element_blank(), legend.position = "none") +
+#     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+# dev.off()
+
+# png('Output Data/rplot32_gof_RMSE.png', width=6.5, height=1.5, units="in", pointsize=8, res=1200)
+#   ggplot(goftablet)+
+#     geom_point(aes(x = RMSE, y = reorder(rownames(goftablet), -RMSE), color=rownames(goftablet)))+
+#     scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+#     scale_colour_manual(aesthetics=c("colour"), values=c(cbpblack[2], cbpblack[8], cbpblack[5], cbpblack[6], cbpblack[3], cbpblack[7])) +
+#     theme_bw(base_size = 8) +
+#     ylab("") +
+#     xlab("Root Mean Squared Error (cfs)") +
+#     theme(legend.title = element_blank(), legend.position = "none") +
+#     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+# dev.off()
+
+png('Output Data/rplot32_gof_NSE.png', width=6.5, height=1.5, units="in", pointsize=8, res=1200)
+  ggplot(goftablet)+
+    geom_point(aes(x = NSE, y = reorder(rownames(goftablet), NSE), color=rownames(goftablet)))+
+    geom_text(aes(x = NSE, y = reorder(rownames(goftablet), NSE), label=round(NSE, digits=2)), nudge_x = 0.05, size=3)+
+    scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+    scale_colour_manual(aesthetics=c("colour"), values=c(cbpblack[2], cbpblack[8], cbpblack[5], cbpblack[6], cbpblack[3], cbpblack[7])) +
+    theme_bw(base_size = 8) +
+    annotate("rect", xmin = -Inf, xmax = 0, ymin = 1, ymax = 6, fill= "grey45", alpha = 0.5) +
+    annotate("rect", xmin = 0, xmax = 0.5, ymin = 1, ymax = 6, fill= "grey55", alpha = 0.5) +
+    annotate("rect", xmin = 0.5, xmax = 0.65, ymin = 1, ymax = 6, fill= "grey70", alpha = 0.5) +
+    annotate("rect", xmin = 0.65, xmax = 0.75, ymin = 1, ymax = 6, fill= "grey85", alpha = 0.5) +
+    annotate("rect", xmin = 0.75, xmax = 1.0, ymin = 1, ymax = 6, fill= "grey95", alpha = 0.5) +
+    geom_text(aes(x= -0.15, y=6, label="Unacceptable"), size=3, hjust="center")+
+    geom_text(aes(x= 0.25, y=6, label="Unsatisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.575, y=6, label="Satisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.7, y=1, label="Good"), size=3, hjust="center")+
+    geom_text(aes(x= 0.875, y=1, label="Very Good"), size=3, hjust="center")+
+    ylab("") +
+    xlab("Nash Sutcliffe Efficiency Factor (-)") +
+    theme(legend.title = element_blank(), legend.position = "none") +
+    guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+dev.off()
+
+# png('Output Data/rplot32_gof_VE.png', width=6.5, height=1.5, units="in", pointsize=8, res=1200)
+#   ggplot(goftablet)+
+#     geom_point(aes(x = VE, y = reorder(rownames(goftablet), VE), color=rownames(goftablet)))+
+#     scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+#     scale_colour_manual(aesthetics=c("colour"), values=c(cbpblack[2], cbpblack[8], cbpblack[5], cbpblack[6], cbpblack[3], cbpblack[7])) +
+#     theme_bw(base_size = 8) +
+#     ylab("") +
+#     xlab("Volumetric Efficiency (-)") +
+#     theme(legend.title = element_blank(), legend.position = "none") +
+#     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+# dev.off()
+# 
+# png('Output Data/rplot32_gof_KGE.png', width=6.5, height=1.5, units="in", pointsize=8, res=1200)
+#   ggplot(goftablet)+
+#     geom_point(aes(x = KGE, y = reorder(rownames(goftablet), KGE), color=rownames(goftablet)))+
+#     scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+#     scale_colour_manual(aesthetics=c("colour"), values=c(cbpblack[2], cbpblack[8], cbpblack[5], cbpblack[6], cbpblack[3], cbpblack[7])) +
+#     theme_bw(base_size = 8) +
+#     ylab("") +
+#     xlab("Kling Gupta Efficiency (-)") +
+#     theme(legend.title = element_blank(), legend.position = "none") +
+#     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+# dev.off()
+```
+
+## 6.3 Observed vs. Predicted 
+```{r obsvpred_plots} 
+library(reshape2)
+mastercv_nn <- results[,c("CDEC_ID", "FLOW", "NN_MSEFIT", "NN_LOGCOSHFIT", "NN_MAEFIT", "NN_MSPEFIT", "NN_WLSEFIT", "NN_LINEXEFIT")]
+mastercv_nn_melted <- melt(mastercv_nn, id.vars=c("CDEC_ID", "FLOW"), measure.vars=c("NN_MSEFIT", "NN_LOGCOSHFIT", "NN_MAEFIT", "NN_MSPEFIT", "NN_WLSEFIT", "NN_LINEXEFIT"), variable.name="LOSS_FUNCTION", value.name="PRED")
+
+pretty_facet_labels <- c("Mean Squared Error (MSE)", "Mean Log Hyperbolic Cosine Error (LOGCOSH)", "Mean Absolute Error (MAE)", "Mean Squared Percentage Error (MSPE)", "Weighted Least Squares Error (WLSE)", "Linear Exponential Error (LINEXE)")
+names(pretty_facet_labels) <- c("NN_MSEFIT", "NN_LOGCOSHFIT", "NN_MAEFIT", "NN_MSPEFIT", "NN_WLSEFIT", "NN_LINEXEFIT")
+
+library(ggpmisc)
+png('Output Data/rplot33_obsvspred_all_nn.png', width=6.5, height=8, units="in", pointsize=8, res=1200)
+  plottoprint <- ggplot(mastercv_nn_melted, aes(x=FLOW, y=PRED)) +
+    geom_point(aes(group=CDEC_ID, colour=CDEC_ID, shape=CDEC_ID)) +
+    geom_smooth(method="lm", se=FALSE, color="black")+
+    stat_poly_eq(formula = y ~ x, 
+                aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                parse = TRUE) +
+    geom_abline(slope=1, intercept=0, color="black", linetype=3)+
+    facet_wrap(~LOSS_FUNCTION, ncol=2, labeller=labeller(LOSS_FUNCTION=pretty_facet_labels))+
+    scale_discrete_manual(aesthetics = "color", values=c(cbpblack, cbpgrey[1]), name="Basin")+
+    scale_discrete_manual(aesthetics= "shape", values=c(1:9), name="Basin") +
+    labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
+    theme(legend.text=element_text(size=10), text=element_text(size=10))+
+    theme_bw(base_size = 8)
+  print(plottoprint)
+dev.off()
+```
+
+## 6.4 Density Plots
+```{r value_density_plots}
+master_cv_1 <- data.frame(results$FLOW)
+master_cv_1$LOSS_FUNCTION <- "Observed"
+master_cv_2 <- data.frame(results[, "NN_MSEFIT"])
+master_cv_2$LOSS_FUNCTION <- "NN_MSEFIT"
+master_cv_3 <- data.frame(results[ , "NN_LOGCOSHFIT"])
+master_cv_3$LOSS_FUNCTION <- "NN_LOGCOSHFIT"
+master_cv_4 <- data.frame(results[ , "NN_MAEFIT"])
+master_cv_4$LOSS_FUNCTION <- "NN_MAEFIT"
+master_cv_5 <- data.frame(results[ , "NN_MSPEFIT"])
+master_cv_5$LOSS_FUNCTION <- "NN_MSPEFIT"
+master_cv_6 <- data.frame(results[ , "NN_WLSEFIT"])
+master_cv_6$LOSS_FUNCTION <- "NN_WLSEFIT"
+master_cv_7 <- data.frame(results[ , "NN_LINEXEFIT"])
+master_cv_7$LOSS_FUNCTION <- "NN_LINEXEFIT"
+
+colnames(master_cv_1)[1] <- colnames(master_cv_2)[1] <- colnames(master_cv_3)[1] <- colnames(master_cv_4)[1] <- colnames(master_cv_5)[1] <- colnames(master_cv_6)[1] <- colnames(master_cv_7)[1] <- "FLOW"
+  
+master_cv <- rbind(master_cv_2, master_cv_3, master_cv_4, master_cv_5, master_cv_6, master_cv_7)
+  
+plottoprint <- ggplot(master_cv) +
+  geom_density(aes(x=FLOW, group=LOSS_FUNCTION, colour=LOSS_FUNCTION, linetype=LOSS_FUNCTION)) +
+  scale_color_manual(values=c(cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), breaks = c("NN_MSEFIT", "NN_LOGCOSHFIT", "NN_MAEFIT", "NN_MSPEFIT", "NN_WLSEFIT", "NN_LINEXEFIT"), name="Pred", labels=c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"))+
+  scale_linetype_manual(values=c("dashed", "dotted", "dotdash", "longdash", "twodash", "solid"), breaks = c("NN_MSEFIT", "NN_LOGCOSHFIT", "NN_MAEFIT", "NN_MSPEFIT", "NN_WLSEFIT", "NN_LINEXEFIT"), labels=c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"), name="Pred")+
+  geom_density(data=master_cv_1, aes(x=FLOW, fill=LOSS_FUNCTION), alpha=0.2) +
+  scale_fill_manual(values=cbpblack[1], name="Obs", label="")+
+  guides(fill = guide_legend(override.aes = list(alpha = 0.2)))+
+  scale_x_continuous(trans="log10")+
+  labs(x ="Unimpaired Flow (cfs)", y = "Density or Frequency of Occurance (%)", color = "")+
+  annotation_logticks(sides = "b")+
+  theme(legend.text=element_text(size=10), text=element_text(size=10), legend.position = "bottom")+
+  theme_bw(base_size = 8)
+    
+png(paste0('Output Data/rplot34_density.png'), width=3.25, height=2.85, units="in", pointsize=8, res=1200)
+  print(plottoprint)
+dev.off()
+```
+
+```{r error_density_plots}
+master_cv_2 <- data.frame(results[, "NN_MSERES"])
+master_cv_2$LOSS_FUNCTION <- "NN_MSERES"
+master_cv_3 <- data.frame(results[ , "NN_LOGCOSHRES"])
+master_cv_3$LOSS_FUNCTION <- "NN_LOGCOSHRES"
+master_cv_4 <- data.frame(results[ , "NN_MAERES"])
+master_cv_4$LOSS_FUNCTION <- "NN_MAERES"
+master_cv_5 <- data.frame(results[ , "NN_MSPERES"])
+master_cv_5$LOSS_FUNCTION <- "NN_MSPERES"
+master_cv_6 <- data.frame(results[ , "NN_WLSERES"])
+master_cv_6$LOSS_FUNCTION <- "NN_WLSERES"
+master_cv_7 <- data.frame(results[ , "NN_LINEXERES"])
+master_cv_7$LOSS_FUNCTION <- "NN_LINEXERES"
+
+colnames(master_cv_2)[1] <- colnames(master_cv_3)[1] <- colnames(master_cv_4)[1] <- colnames(master_cv_5)[1] <- colnames(master_cv_6)[1] <- colnames(master_cv_7)[1] <- "FLOW"
+  
+master_cv <- rbind(master_cv_2, master_cv_3, master_cv_4, master_cv_5, master_cv_6, master_cv_7)
+master_cv$LOSS_FUNCTION <- factor(master_cv$LOSS_FUNCTION, levels=c("NN_MSERES", "NN_LOGCOSHRES", "NN_MAERES", "NN_MSPERES", "NN_WLSERES", "NN_LINEXERES"))
+
+loss_labs <- c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE")
+names(loss_labs) <- c("NN_MSERES", "NN_LOGCOSHRES", "NN_MAERES", "NN_MSPERES", "NN_WLSERES", "NN_LINEXERES")
+
+# NOTE!!! cannot log transform because it gets rid of all negative residuals
+plottoprint <- ggplot(master_cv) +
+  geom_density(aes(x=FLOW, group=LOSS_FUNCTION, colour=LOSS_FUNCTION), show.legend = FALSE) +
+  scale_color_manual(values=c(cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), breaks = c("NN_MSERES", "NN_LOGCOSHRES", "NN_MAERES", "NN_MSPERES", "NN_WLSERES", "NN_LINEXERES"), name="Pred", labels=c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"))+
+  # scale_x_continuous(trans="log10")+ # DO NOT DO THIS
+  # annotation_logticks(sides = "b")+
+  facet_wrap(~LOSS_FUNCTION, nrow=2, labeller=labeller(LOSS_FUNCTION=loss_labs))+
+  labs(x ="Model Residuals, Predicted-Observed (cfs)", y = "Density or Frequency of Occurance (%)", color = "")+
+  theme(legend.text=element_text(size=10), text=element_text(size=10), legend.position = "bottom")+
+  theme_bw(base_size = 8)
+    
+png(paste0('Output Data/rplot34_density_res.png'), width=6.5, height=2.5, units="in", pointsize=8, res=1200)
+  print(plottoprint)
+dev.off()
+
+# QQ plot to check normality in the distribution
+plottoprint <- ggplot(master_cv) +
+  stat_qq(aes(sample=FLOW, group=LOSS_FUNCTION, colour=LOSS_FUNCTION, shape=LOSS_FUNCTION), size=1)+
+  scale_discrete_manual(aesthetics = "color", values=c(cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), breaks = c("NN_MSERES", "NN_LOGCOSHRES", "NN_MAERES", "NN_MSPERES", "NN_WLSERES", "NN_LINEXERES"), name="Pred", labels=c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"))+
+  scale_shape_manual(values=c(4, 2, 5, 8, 16, 15), breaks = c("NN_MSERES", "NN_LOGCOSHRES", "NN_MAERES", "NN_MSPERES", "NN_WLSERES", "NN_LINEXERES"), name="Pred", labels=c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"))+
+  labs(x ="Theoretical Quantiles", y = "Sample Quantiles in\nModel Residuals, Predicted-Observed (AF/m)")+
+  theme(legend.text=element_text(size=10), text=element_text(size=10), legend.position = "bottom")+
+  theme_bw(base_size = 8)
+
+png(paste0('Output Data/rplot34_qqplot_modelres.png'), width=3.25, height=2.85, units="in", pointsize=8, res=1200)
+  print(plottoprint)
+dev.off()
+```
+
+## 6.5 Map Plots
+```{r error_mapplots}
+# modelform can be: "lm", "nn"
+library(RColorBrewer)
+library(lattice)
+library(grid)
+
+br2map <- function(gof_results, losstype, modelform){ 
+  basinsc <- sptdf
+  results <- data.frame(t(gof_results))
+  results$CDEC_ID <- rownames(results)
+  basinsc <- merge(basinsc, results, by="CDEC_ID", all=TRUE)
+  counties <- list(first=TRUE, "sp.polygons", cacounties, fill="gray88", col="white")
+
+  png(paste0('Output Data/rplot35_br2map_', modelform, "_", losstype , '.png'), width=3.25, height=3, units="in", pointsize=8, res=1200)
+  par(mar=c(0,0,0,0)+0.1, cex=1)
+  mycolors <- colorRampPalette(c(cbpblack[2],cbpblack[4],cbpblack[6]))
+  tbdspplot <- spplot(basinsc["bR2"], xlim = c(caboundary@bbox["x", "min"], caboundary@bbox["x", "max"]), ylim = c(caboundary@bbox["y", "min"], caboundary@bbox["y", "max"]), cex=0.8, sp.layout=counties, col.regions = mycolors(100), colorkey = list(right = list( # see ?levelplot in package trellis, argument colorkey:
+                      fun = draw.colorkey, 
+                      args = list(
+                             key = list(
+                                  at = seq(0, 1.0, 1/100), # colour breaks
+                                  col = mycolors(100), # colours
+                                  labels = list(
+                                      at = seq(0, 1.0, 0.2),
+                                      labels = seq(0, 1.0, 0.2)
+                                      )
+                                   )
+                              )
+                      )
+          )
+  )
+  print(tbdspplot)
+  grid.text("bR2(-)", 0.57, 0.88)
+  dev.off()
+}
+
+br2map(gof_nn_mse_by_basins, "mse", "nn")
+br2map(gof_nn_mae_by_basins, "mae", "nn")
+# br2map(gof_nn_msle_by_basins, "msle", "nn")
+# br2map(gof_nn_mape_by_basins, "mape", "nn")
+br2map(gof_nn_logcosh_by_basins, "logcosh", "nn")
+br2map(gof_nn_mspe_by_basins, "mspe", "nn")
+# br2map(gof_nn_male_by_basins, "male", "nn")
+# br2map(gof_nn_msale_by_basins, "msale", "nn")
+br2map(gof_nn_wlse_by_basins, "wlse", "nn")
+br2map(gof_nn_linexe_by_basins, "linexe", "nn")
+```
+
+## 6.6 Dotcharts
+```{r nn_dotchart}
+gofdotchart <- function(gof_results_mse, gof_results_logcosh, gof_results_mae, gof_results_mspe, gof_results_wlse, gof_results_linexe, modeltype, fitofinterest){
+  tgof_results_mse <- data.frame(t(gof_results_mse))
+  tgof_results_mse$CDEC_ID <- rownames(tgof_results_mse)
+  basinsc <- sptdf@data
+  basinsc <- merge(basinsc, tgof_results_mse, by="CDEC_ID", all=TRUE)
+  basinsc$LOSS_FUNCTION <- "MSE"
+  
+  tgof_results_logcosh <- data.frame(t(gof_results_logcosh))
+  tgof_results_logcosh$CDEC_ID <- rownames(tgof_results_logcosh)
+  basinsc2 <- sptdf@data
+  basinsc2 <- merge(basinsc2, tgof_results_logcosh, by="CDEC_ID", all=TRUE)
+  basinsc2$LOSS_FUNCTION <- "LOGCOSH"
+  
+  tgof_results_mae <- data.frame(t(gof_results_mae))
+  tgof_results_mae$CDEC_ID <- rownames(tgof_results_mae)
+  basinsc3 <- sptdf@data
+  basinsc3 <- merge(basinsc3, tgof_results_mae, by="CDEC_ID", all=TRUE)
+  basinsc3$LOSS_FUNCTION <- "MAE"
+  
+  tgof_results_mspe <- data.frame(t(gof_results_mspe))
+  tgof_results_mspe$CDEC_ID <- rownames(tgof_results_mspe)
+  basinsc4 <- sptdf@data
+  basinsc4 <- merge(basinsc4, tgof_results_mspe, by="CDEC_ID", all=TRUE)
+  basinsc4$LOSS_FUNCTION <- "MSPE"
+  
+  tgof_results_wlse <- data.frame(t(gof_results_wlse))
+  tgof_results_wlse$CDEC_ID <- rownames(tgof_results_wlse)
+  basinsc5 <- sptdf@data
+  basinsc5 <- merge(basinsc5, tgof_results_wlse, by="CDEC_ID", all=TRUE)
+  basinsc5$LOSS_FUNCTION <- "WLSE"
+  
+  tgof_results_linexe <- data.frame(t(gof_results_linexe))
+  tgof_results_linexe$CDEC_ID <- rownames(tgof_results_linexe)
+  basinsc6 <- sptdf@data
+  basinsc6 <- merge(basinsc6, tgof_results_linexe, by="CDEC_ID", all=TRUE)
+  basinsc6$LOSS_FUNCTION <- "LINEXE"
+
+  if(fitofinterest=="ME"){
+    fitofinterestlabel <- "Mean Error (AF)"
+  } else if(fitofinterest=="MAE"){
+    fitofinterestlabel <- "Mean Absolute Error (AF)"
+  } else if(fitofinterest=="MSE"){
+    fitofinterestlabel <- "Mean Squared Error (AF^2)"
+  } else if(fitofinterest=="RMSE"){
+    fitofinterestlabel <- "Root Mean Squared Error (AF)"
+  } else if(fitofinterest=="NRMSE.."){
+    fitofinterestlabel <- "Normalized Root Mean Squared Error (AF^2)"
+  } else if(fitofinterest=="PBIAS.."){
+    fitofinterestlabel <- "Percent Bias (-)"
+  } else if(fitofinterest=="RSR"){
+    fitofinterestlabel <- "RMSE to Standard Deviation of Observations Ratio (-)"
+  } else if(fitofinterest=="NSE"){
+    fitofinterestlabel <- "Nash-Sutcliffe Efficiency (-)"
+  } else if(fitofinterest=="rSD"){
+    fitofinterestlabel <- "Ratio of Standard Deviations (-)"
+  } else if(fitofinterest=="mNSE"){
+    fitofinterestlabel <- "Modified Nash-Sutcliffe Efficiency (-)"
+  } else if(fitofinterest=="rNSE"){
+    fitofinterestlabel <- "Relative Nash-Sutcliffe Efficiency (-)"
+  } else if(fitofinterest=="d"){
+    fitofinterestlabel <- "Index of Agreement (-)"
+  } else if(fitofinterest=="md"){
+    fitofinterestlabel <- "Modified Index of Agreement (-)"
+  } else if(fitofinterest=="rd"){
+    fitofinterestlabel <- "Relative Index of Agreement (-)"
+  } else if(fitofinterest=="cp"){
+    fitofinterestlabel <- "Persistence Index (-)"
+  } else if(fitofinterest=="r"){
+    fitofinterestlabel <- "Pearson Correlation coefficient (-)"
+  } else if(fitofinterest=="R2"){
+    fitofinterestlabel <- "Coefficient of Determination (-)"
+  } else if(fitofinterest=="bR2"){
+    fitofinterestlabel <- "Bias-Corrected Coefficient of Determination (-)"
+  } else if(fitofinterest=="KGE"){
+    fitofinterestlabel <- "Kling-Gupta Efficiency (-)"
+  } else if(fitofinterest=="VE"){
+    fitofinterestlabel <- "Volumetric Efficiency (AF)"
+  } else{
+    print("Input a measure of fit provided by the gof function in HydroGOF package!")
+  }
+  
+  basinscr <- melt(basinsc, id.vars=c("CDEC_ID", "LOSS_FUNCTION"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc2r <- melt(basinsc2, id.vars=c("CDEC_ID", "LOSS_FUNCTION"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc3r <- melt(basinsc3, id.vars=c("CDEC_ID", "LOSS_FUNCTION"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc4r <- melt(basinsc4, id.vars=c("CDEC_ID", "LOSS_FUNCTION"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc5r <- melt(basinsc5, id.vars=c("CDEC_ID", "LOSS_FUNCTION"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc6r <- melt(basinsc6, id.vars=c("CDEC_ID", "LOSS_FUNCTION"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  
+  # order the basins based on LOGO values, decreasing
+  orderrownums <- as.numeric(row.names(basinscr[order(basinscr$VALUE, decreasing=TRUE), ]))
+  basinscr <- basinscr[orderrownums, ]
+  basinsc2r <- basinsc2r[orderrownums, ]
+  basinsc3r <- basinsc3r[orderrownums, ]
+  basinsc4r <- basinsc4r[orderrownums, ]
+  basinsc5r <- basinsc5r[orderrownums, ]
+  basinsc6r <- basinsc6r[orderrownums, ]
+  
+  # bind aacross the different grouping styles
+  basinscm <- rbind(basinscr, basinsc2r, basinsc3r, basinsc4r, basinsc5r, basinsc6r)
+  basinscm$LOSS_FUNCTION <- factor(basinscm$LOSS_FUNCTION, levels = c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"))
+
+  plottoprint <- ggplot(data=basinscm, aes(x=VALUE, y=CDEC_ID)) +
+      geom_point(aes(shape=LOSS_FUNCTION, color=LOSS_FUNCTION), size=4)+
+      scale_shape_manual(breaks = c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"), values=c(4, 2, 5, 8, 16, 15)) + 
+      scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), breaks = c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE")) +
+      labs(x=fitofinterestlabel, y="")+
+      theme_bw()+
+      theme(legend.position="bottom", legend.title = element_blank())+
+      guides(color = guide_legend(nrow = 1), shape= guide_legend(nrow = 1))
+  
+  png(paste0('Output Data/rplot310_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+    print(plottoprint)
+  dev.off()
+}
+
+# gofdotchart(gof_nn_mse_by_basins, gof_nn_logcosh_by_basins, gof_nn_mae_by_basins, gof_nn_mspe_by_basins, gof_nn_wlse_by_basins, gof_nn_linexe_by_basins, "nn", "d")
+gofdotchart(gof_nn_mse_by_basins, gof_nn_logcosh_by_basins, gof_nn_mae_by_basins, gof_nn_mspe_by_basins, gof_nn_wlse_by_basins, gof_nn_linexe_by_basins, "nn", "bR2")
+gofdotchart(gof_nn_mse_by_basins, gof_nn_logcosh_by_basins, gof_nn_mae_by_basins, gof_nn_mspe_by_basins, gof_nn_wlse_by_basins, gof_nn_linexe_by_basins, "nn", "NSE")
+# gofdotchart(gof_nn_mse_by_basins, gof_nn_logcosh_by_basins, gof_nn_mae_by_basins, gof_nn_mspe_by_basins, gof_nn_wlse_by_basins, gof_nn_linexe_by_basins, "nn", "KGE")
+# gofdotchart(gof_nn_mse_by_basins, gof_nn_logcosh_by_basins, gof_nn_mae_by_basins, gof_nn_mspe_by_basins, gof_nn_wlse_by_basins, gof_nn_linexe_by_basins, "nn", "VE")
+```
+

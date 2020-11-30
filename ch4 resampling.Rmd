@@ -1,0 +1,1448 @@
+---
+title: "resampling"
+author: "Ellie White"
+date: "March 23, 2019"
+output: html_document
+---
+
+Record of how a model's predictive capability is assessed given different resampling techniques. 
+
+# Contents   
+1.0 Data Gathering  
+2.0 Data Transformations  
+3.0 Functions  
+4.0 Modeling and Resampling 
+  4.1 LM  
+  4.2 GLM  
+  4.3 RF  
+  4.4 NN  
+5.0 Post Processing
+  5.1 Aggregate Basins - CV  
+  5.2 GOF Post Processing  
+6.0 Plots
+  6.1 GOF Comparisons
+  6.2 Observed vs. Predicted  
+  6.3 Density  
+  6.4 Map Plots  
+  6.5 Dotcharts  
+  6.6 Boxplots  
+  6.7 Time Series  
+
+```{r, include=FALSE} 
+library(knitr)
+library(formatR)
+opts_chunk$set(fig.width = 7.5, fig.height = 7.5, collapse = TRUE, tidy = FALSE)
+```
+
+```{r citations} 
+# cite R 
+toBibtex(citation())
+
+# cite R studio
+RStudio.Version()
+
+# cite packages
+citethese <- c("raster", "sp", "rgdal", "dismo", "statmod", "Hmisc", "randomForest", "keras", "reshape2", "ggpmisc" )
+for(c in seq_along(citethese)){
+  print(toBibtex(citation(citethese[c])))
+}
+remove(c)
+
+# session info in case anything goes wrong
+sessionInfo()
+```
+
+# 1.0 Data Gathering
+```{r data_gathering} 
+set.seed(3232019)
+moddf <- readRDS('Intermediary Data/moddf.rds')
+```
+
+```{r data_gathering_extra}
+# some helpful dataframes, may come in handy later for post processing
+sptdf <- df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
+
+sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,]
+
+coordinates(sptdf) <- ~LONGITUDE + LATITUDE
+proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
+
+library(rgdal)
+library(sp)
+library(raster)
+basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily.shp')
+caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
+cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
+
+# projections used for California
+tealalbers <- crs("+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +datum=NAD83 +units=km +ellps=GRS80")
+albers <- crs("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0")
+
+# transform to all to Albers
+sptdf <- spTransform(sptdf, albers)
+basins <- spTransform(basins, albers)
+caboundary <- spTransform(caboundary, albers)
+cacounties <- spTransform(cacounties, albers)
+
+# join the information on the stations to the SpatialPolygonsDataFrame
+basins@data <- merge(basins@data, sptdf, by="CDEC_ID")
+
+# wide format data
+cdec_fnf_wide <- read.csv('Intermediary Data/cdec_fnf_wide.csv')
+cdec_fnf_wide$DATE <- as.Date(cdec_fnf_wide$DATE, format="%Y-%m-%d")
+cdec_fnf_wide <- cdec_fnf_wide[order(cdec_fnf_wide$DATE),]
+
+# The full records span 1900-01-01 to 1980-09-01, but most records start at 1982, we started PRISM downloads at 2010
+cdec_fnf_wide <- cdec_fnf_wide[cdec_fnf_wide$DATE>="2010-01-01", ]
+```
+
+```{r visuals}
+# colourblind palettes
+# ordered:     black      pink        orange     yellow     green       blue      darkorange  lightblue
+cbpgrey <-  c("#999999", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+```
+
+# 2.0 Data Tranformations
+```{r data_transformation} 
+# none
+```
+
+# 3.0 Functions
+```{r funcstoimport} 
+# library(hydroGOF) # this is giving wrong functions, do not load it in make sure the search path is clear
+goffuncs <- list.files("libraries/HydroGOFm/R")
+for(i in 1:length(goffuncs)){
+  source(paste0("Libraries/HydroGOFm/R/", goffuncs[i]))
+}
+remove(goffuncs)
+
+search()
+```
+
+# 4.0 Modelling and Resampling
+
+## 4.1 LM
+```{r lm_modelling_and_cv}
+# groupingstyle can be: resub, 2L, 5L, 10L, logo, lmgo, lho. Notice how a plain 2, 5, and 10 will not work, you have to declare it an integer
+
+library(dismo)
+lmcv <- function(data, groupingstyle){
+  # for resubstitution, where testing data and training data is the same
+  if(groupingstyle=="resub"){
+    linearmodel <- lm(FLOW~., data=data[ , c(10, 13:ncol(data))])
+    predictions <- predict(linearmodel, data, type='response')
+    results <- cbind(obs=data$FLOW, pred=predictions)
+    modgof <- gof(as.data.frame(results)$pred, as.data.frame(results)$obs)
+  }
+  
+  # for k-fold cross validation
+  if(is.integer(groupingstyle)){
+    group <- kfold(data, groupingstyle)
+    linearmodel <- results <- modgof <- list()
+    for (k in 1:groupingstyle) {
+      trainset <- data[group != k, ]
+      testset <- data[group == k, ]
+      linearmodel[[k]] <- lm(FLOW~., data=trainset[,c(10, 13:ncol(trainset))])
+      predictions <- predict(linearmodel[[k]], testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+  
+  # for leave one group (basin) out cross validation
+  if(groupingstyle=="logo"){
+    linearmodel <- results <- modgof <- list()
+    for (k in 1:(length(unique(data$CDEC_ID)))){
+      h <- unique(data$CDEC_ID)[k]
+      testset <- data[data$CDEC_ID==h,]
+      trainset <- data[data$CDEC_ID!=h,]
+      linearmodel[[k]] <- lm(FLOW~., data=trainset[,c(10, 13:ncol(trainset))])
+      predictions <- predict(linearmodel[[k]], testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+    colnames(modgof) <- unique(data$CDEC_ID)
+  }
+  
+  # for random 5-fold leave multiple groups out cross validation, meaning a random 1/5 of the basins will be left out of training
+  if(groupingstyle=="lmgo"){
+    nfolds <- 3
+    group <- as.data.frame(unique(data$CDEC_ID))
+    colnames(group) <- "CDEC_ID"
+    group$kftrain <- kfold(nrow(group), nfolds)
+    data <- merge(data, group, by="CDEC_ID")
+    
+    linearmodel <- results <- modgof <- list()
+    for (k in 1:nfolds) {
+      testset <- data[data$kftrain == k, ]
+      trainset <- data[data$kftrain != k, ]
+      linearmodel[[k]] <- lm(FLOW~., data=trainset[,c(10, 13:ncol(trainset))])
+      predictions <- predict(linearmodel[[k]], testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+  
+  # # for leave hierarchies out cross validation
+  # if(groupingstyle=="lho"){
+  # }
+  
+  if(groupingstyle=="resub"){
+    list(mod=linearmodel, results=results, gof=modgof)
+    }
+  else if(groupingstyle=="logo"){
+    list(mod=linearmodel, results=results, gof=modgof)
+    }
+  else{
+    list(mod=linearmodel, results=results, gof=modgof, kf=group)
+    }
+}
+
+# lm_resub_results <- lmcv(moddf, "resub")
+# lm_2fold_results <- lmcv(moddf, 2L)
+# lm_5fold_results <- lmcv(moddf, 5L)
+# lm_10fold_results <- lmcv(moddf, 10L)
+# lm_logo_results <- lmcv(moddf, "logo")
+# lm_lmgo_results <- lmcv(moddf, "lmgo")
+# 
+# saveRDS(lm_resub_results, file="Output Data/rds/lm_resub_results.RDS")
+# saveRDS(lm_2fold_results, file="Output Data/rds/lm_2fold_results.RDS")
+# saveRDS(lm_5fold_results, file="Output Data/rds/lm_5fold_results.RDS")
+# saveRDS(lm_10fold_results, file="Output Data/rds/lm_10fold_results.RDS")
+# saveRDS(lm_logo_results, file="Output Data/rds/lm_logo_results.RDS")
+# saveRDS(lm_lmgo_results, file="Output Data/rds/lm_lmgo_results.RDS")
+
+lm_resub_results <- readRDS("Output Data/rds/lm_resub_results.RDS")
+lm_2fold_results <- readRDS("Output Data/rds/lm_2fold_results.RDS")
+lm_5fold_results <- readRDS("Output Data/rds/lm_5fold_results.RDS")
+lm_10fold_results <- readRDS("Output Data/rds/lm_10fold_results.RDS")
+lm_logo_results <- readRDS("Output Data/rds/lm_logo_results.RDS")
+lm_lmgo_results <- readRDS("Output Data/rds/lm_lmgo_results.RDS")
+```
+
+## 4.2 GLM
+```{r glm_modelling_and_cv} 
+library(statmod)
+glmcv <- function(data, groupingstyle, datatype){  
+  # for resubstitution, where testing data and training data is the same
+  if(groupingstyle=="resub"){
+    linearmodel <- glm(FLOW~., data=data[,c(10, 13:ncol(data))], family=tweedie(var.power=1.1, link.power=0), maxit=1000)
+    predictions <- predict(linearmodel, data, type='response')
+    results <- cbind(obs=data$FLOW, pred=predictions)
+    modgof <- gof(as.data.frame(results)$pred, as.data.frame(results)$obs)
+  }
+  
+  # for k-fold cross validation
+  if(is.integer(groupingstyle)){
+    group <- kfold(data, groupingstyle)
+    linearmodel <- results <- modgof <- list()
+    for (k in 1:groupingstyle) {
+      trainset <- data[group != k, ]
+      testset <- data[group == k, ]
+      linearmodel[[k]] <- glm(FLOW~., data=trainset[,c(10, 13:ncol(trainset))], family=tweedie(var.power=1.1, link.power=0), maxit=1000)
+      predictions <- predict(linearmodel[[k]], testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+  
+  # for leave one group (basin) out cross validation
+  if(groupingstyle=="logo"){
+    linearmodel <- results <- modgof <- list()
+    for (k in 1:(length(unique(data$CDEC_ID)))){
+      h <- unique(data$CDEC_ID)[k]
+      testset <- data[data$CDEC_ID==h,]
+      trainset <- data[data$CDEC_ID!=h,]
+      linearmodel[[k]] <- glm(FLOW~., data=trainset[,c(10, 13:ncol(trainset))], family=tweedie(var.power=1.1, link.power=0), maxit=1000)
+      predictions <- predict(linearmodel[[k]], testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+    colnames(modgof) <- unique(data$CDEC_ID)
+  }
+  
+  # for random 5-fold leave multiple groups out cross validation, meaning a random 1/5 of the basins will be left out of training
+  if(groupingstyle=="lmgo"){
+    nfolds <- 3
+    group <- as.data.frame(unique(data$CDEC_ID))
+    colnames(group) <- "CDEC_ID"
+    group$kftrain <- kfold(nrow(group), nfolds)
+    data <- merge(data, group, by="CDEC_ID")
+    
+    linearmodel <- results <- modgof <- list()
+    for (k in 1:nfolds) {
+      testset <- data[data$kftrain == k, ]
+      trainset <- data[data$kftrain != k, ]
+      linearmodel[[k]] <- glm(FLOW~., data=trainset[,c(10, 13:ncol(trainset))], family=tweedie(var.power=1.1, link.power=0), maxit=1000)
+      predictions <- predict(linearmodel[[k]], testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+  
+  # # for leave hierarchies out cross validation
+  # if(groupingstyle=="lho"){
+  # }
+  
+  if(groupingstyle=="resub"){
+    list(mod=linearmodel, results=results, gof=modgof)
+    }
+  else if(groupingstyle=="logo"){
+    list(mod=linearmodel, results=results, gof=modgof)
+    }
+  else{
+    list(mod=linearmodel, results=results, gof=modgof, kf=group)
+    }
+}
+
+# glmtwd_resub_results <- glmcv(moddf, "resub")
+# glmtwd_2fold_results <- glmcv(moddf, 2L)
+# glmtwd_5fold_results <- glmcv(moddf, 5L)
+# glmtwd_10fold_results <- glmcv(moddf, 10L)
+# glmtwd_logo_results <- glmcv(moddf, "logo")
+# glmtwd_lmgo_results <- glmcv(moddf, "lmgo")
+# 
+# saveRDS(glmtwd_resub_results, file="Output Data/rds/glmtwd_resub_results.RDS")
+# saveRDS(glmtwd_2fold_results, file="Output Data/rds/glmtwd_2fold_results.RDS")
+# saveRDS(glmtwd_5fold_results, file="Output Data/rds/glmtwd_5fold_results.RDS")
+# saveRDS(glmtwd_10fold_results, file="Output Data/rds/glmtwd_10fold_results.RDS")
+# saveRDS(glmtwd_logo_results, file="Output Data/rds/glmtwd_logo_results.RDS")
+# saveRDS(glmtwd_lmgo_results, file="Output Data/rds/glmtwd_lmgo_results.RDS")
+
+glmtwd_resub_results <- readRDS("Output Data/rds/glmtwd_resub_results.RDS")
+glmtwd_2fold_results <- readRDS("Output Data/rds/glmtwd_2fold_results.RDS")
+glmtwd_5fold_results <- readRDS("Output Data/rds/glmtwd_5fold_results.RDS")
+glmtwd_10fold_results <- readRDS("Output Data/rds/glmtwd_10fold_results.RDS")
+glmtwd_logo_results <- readRDS("Output Data/rds/glmtwd_logo_results.RDS")
+glmtwd_lmgo_results <- readRDS("Output Data/rds/glmtwd_lmgo_results.RDS")
+```
+
+## 4.3 RF
+```{r rf_modelling_and_cv}
+# we are not saving the models because it takes too much memory. so rrfmodel is no longer specified as a list and took mod=rfmodel out of return list. 
+
+library(randomForest)
+
+# # let's first optimize the tuning parameter mtry
+# trf <- tuneRF(moddf[,c(13:ncol(moddf))], moddf$FLOW, mtryStart=15, stepFactor=2)
+# mt <- trf[which.min(trf[,2]), 1]
+mt <- 20
+
+rfcv <- function(data, groupingstyle, datatype){ 
+  # for resubstitution, where testing data and training data is the same
+  if(groupingstyle=="resub"){
+    rfmodel <- randomForest(FLOW~. , data=data[,c(10, 13:ncol(data))], mtry=mt)
+    predictions <- predict(rfmodel, data, type='response')
+    results <- cbind(obs=data$FLOW, pred=predictions)
+    modgof <- gof(as.data.frame(results)$pred, as.data.frame(results)$obs)
+  }
+  
+  # for k-fold cross validation
+  if(is.integer(groupingstyle)){
+    group <- kfold(data, groupingstyle)
+    results <- modgof <- list()
+    for(k in 1:groupingstyle) {
+      trainset <- data[group != k, ]
+      testset <- data[group == k, ]
+      rfmodel <- randomForest(FLOW~. , data=trainset[,c(10, 13:ncol(trainset))], mtry=mt)
+      predictions <- predict(rfmodel, testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+  
+  # for leave one group (basin) out cross validation
+  if(groupingstyle=="logo"){
+    results <- modgof <- list()
+    for (k in 1:(length(unique(data$CDEC_ID)))){
+      h <- unique(data$CDEC_ID)[k]
+      testset <- data[data$CDEC_ID==h,]
+      trainset <- data[data$CDEC_ID!=h,]
+      rfmodel <- randomForest(FLOW~. , data=trainset[,c(10, 13:ncol(trainset))], mtry=mt)
+      predictions <- predict(rfmodel, testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+    colnames(modgof) <- unique(data$CDEC_ID)
+  }
+  
+  # for random 5-fold leave multiple groups out cross validation, meaning a random 1/5 of the basins will be left out of training
+  if(groupingstyle=="lmgo"){
+    nfolds <- 3
+    group <- as.data.frame(unique(data$CDEC_ID))
+    colnames(group) <- "CDEC_ID"
+    group$kftrain <- kfold(nrow(group), nfolds)
+    data <- merge(data, group, by="CDEC_ID")
+    
+    results <- modgof <- list()
+    for (k in 1:nfolds) {
+      testset <- data[data$kftrain == k, ]
+      trainset <- data[data$kftrain != k, ]
+      rfmodel <- randomForest(FLOW~. , data=trainset[,c(10, 13:ncol(trainset))], mtry=mt)
+      predictions <- predict(rfmodel, testset, type='response')
+      results[[k]] <- cbind(obs=testset$FLOW, pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+  
+  if(groupingstyle=="resub"){
+    list(results=results, gof=modgof)
+  } else if(groupingstyle=="logo"){
+    list(results=results, gof=modgof)
+  } else{
+    list(results=results, gof=modgof, kf=group)
+  }
+}
+
+# rf_resub_results <- rfcv(moddf, "resub")
+# rf_2fold_results <- rfcv(moddf, 2L)
+# rf_5fold_results <- rfcv(moddf, 5L)
+# rf_10fold_results <- rfcv(moddf, 10L)
+# rf_logo_results <- rfcv(moddf, "logo")
+# rf_lmgo_results <- rfcv(moddf, "lmgo")
+# 
+# saveRDS(rf_resub_results, file="Output Data/rds/rf_resub_results.RDS")
+# saveRDS(rf_2fold_results, file="Output Data/rds/rf_2fold_results.RDS")
+# saveRDS(rf_5fold_results, file="Output Data/rds/rf_5fold_results.RDS")
+# saveRDS(rf_10fold_results, file="Output Data/rds/rf_10fold_results.RDS")
+# saveRDS(rf_logo_results, file="Output Data/rds/rf_logo_results.RDS")
+# saveRDS(rf_lmgo_results, file="Output Data/rds/rf_lmgo_results.RDS")
+
+rf_resub_results <- readRDS("Output Data/rds/rf_resub_results.RDS")
+rf_2fold_results <- readRDS("Output Data/rds/rf_2fold_results.RDS")
+rf_5fold_results <- readRDS("Output Data/rds/rf_5fold_results.RDS")
+rf_10fold_results <- readRDS("Output Data/rds/rf_10fold_results.RDS")
+rf_logo_results <- readRDS("Output Data/rds/rf_logo_results.RDS")
+rf_lmgo_results <- readRDS("Output Data/rds/rf_lmgo_results.RDS")
+```
+
+## 4.4 NN
+```{r nn_setup}
+# # install and set up our environment for deep learning
+# devtools::install_github("rstudio/reticulate")
+# devtools::install_github("rstudio/keras")
+# devtools::install_github("rstudio/tensorflow")
+
+library(keras)
+install_keras(tensorflow = "1.12")
+
+# # example to see if the installation works
+# mnist <- dataset_mnist()
+# mnist$train$x <- mnist$train$x / 255
+# mnist$test$x <- mnist$test$x / 255
+# 
+# model <- keras_model_sequential() %>%
+#   layer_flatten(input_shape = c(28, 28)) %>%
+#   layer_dense(units = 128, activation = "relu") %>%
+#   layer_dropout(0.2) %>%
+#   layer_dense(10, activation = "softmax")
+# 
+# model %>%
+#   compile(loss = "sparse_categorical_crossentropy",
+#           optimizer = "adam",
+#           metrics = "accuracy")
+# 
+# print_dot_callback <- callback_lambda(
+#   on_epoch_end = function(epoch, logs) {
+#     if (epoch %% 10 == 0) cat("\n")
+#     cat(".")
+#   }
+# )
+# 
+# model %>%
+#   fit(
+#     x = mnist$train$x,
+#     y = mnist$train$y,
+#     epochs = 5,
+#     validation_split = 0.3,
+#     verbose = 0,
+#     callbacks = list(print_dot_callback)
+#   )
+```
+
+```{r nn_modeling_and_cv}
+nncv <- function(data, groupingstyle, datatype){
+  # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
+  trainingdim <- dim(data[,c(10,13:(ncol(data)-1))])
+  nnmodel <- keras_model_sequential() %>%
+  layer_dense(units=64, activation="relu", input_shape=trainingdim[[2]]) %>%
+  layer_dense(units=64, activation="relu") %>%
+  layer_dense(units=1) # number of outputs, here we just want one prediction
+
+  nnmodel %>% # to compile the model, loss functions are defined here
+    compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
+
+  # for resubstitution, where testing data and training data is the same
+  if(groupingstyle=="resub"){
+    trainsetpvs <- as.matrix(data[,c(10,13:(ncol(data)-1))])
+    trainsetrv <- as.matrix(data$FLOW)
+    nnmodel %>%  # this is to fit the model coefficients
+      fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+    predictions <- nnmodel %>% predict(trainsetpvs)
+    predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+    results <- cbind(obs=trainsetrv[ , 1], pred=predictions)
+    modgof <- gof(as.data.frame(results)$pred, as.data.frame(results)$obs)
+  }
+
+  # for k-fold cross validation
+  if(is.integer(groupingstyle)){
+    group <- kfold(data, groupingstyle)
+    results <- modgof <- list()
+    for(k in 1:groupingstyle) {
+      trainset <- data[group != k, ]
+      testset <- data[group == k, ]
+
+      # seperate into predictor variables and response variable
+      testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+      trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+      testsetrv <- as.matrix(testset$FLOW)
+      trainsetrv <- as.matrix(trainset$FLOW)
+
+      nnmodel %>%
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset))) # adding rownames here for later stitching the dataset back to its original shape
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+
+  # for leave one group (basin) out cross validation
+  if(groupingstyle=="logo"){
+    results <- modgof <- list()
+
+    for (k in 1:(length(unique(data$CDEC_ID)))){
+      h <- unique(data$CDEC_ID)[k]
+      testset <- data[data$CDEC_ID==h,]
+      trainset <- data[data$CDEC_ID!=h,]
+      testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+      trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+      testsetrv <- as.matrix(testset$FLOW)
+      trainsetrv <- as.matrix(trainset$FLOW)
+
+      nnmodel %>%
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+    colnames(modgof) <- unique(data$CDEC_ID)
+  }
+
+  # for random 5-fold leave multiple groups out cross validation, meaning a random 1/5 of the basins will be left out of training
+  if(groupingstyle=="lmgo"){
+    nfolds <- 5
+    group <- as.data.frame(unique(data$CDEC_ID))
+    colnames(group) <- "CDEC_ID"
+    group$kftrain <- kfold(nrow(group), nfolds)
+    data <- merge(data, group, by="CDEC_ID")
+
+    results <- modgof <- list()
+    for(k in 1:nfolds) {
+      testset <- data[data$kftrain == k, ]
+      trainset <- data[data$kftrain != k, ]
+      testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-2))])
+      trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-2))])
+      testsetrv <- as.matrix(testset$FLOW)
+      trainsetrv <- as.matrix(trainset$FLOW)
+
+      nnmodel %>%
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+
+  if(groupingstyle=="resub"){
+    list(results=results, gof=modgof)
+  } else if(groupingstyle=="logo"){
+    list(results=results, gof=modgof)
+  } else{
+    list(results=results, gof=modgof, kf=group)
+  }
+}
+
+# nn_resub_results <- nncv(moddf, "resub")
+# nn_2fold_results <- nncv(moddf, 2L)
+# nn_5fold_results <- nncv(moddf, 5L)
+# nn_10fold_results <- nncv(moddf, 10L)
+# nn_logo_results <- nncv(moddf, "logo")
+# nn_lmgo_results <- nncv(moddf, "lmgo")
+# 
+# saveRDS(nn_resub_results, file="Output Data/rds/nn_resub_results.RDS")
+# saveRDS(nn_2fold_results, file="Output Data/rds/nn_2fold_results.RDS")
+# saveRDS(nn_5fold_results, file="Output Data/rds/nn_5fold_results.RDS")
+# saveRDS(nn_10fold_results, file="Output Data/rds/nn_10fold_results.RDS")
+# saveRDS(nn_logo_results, file="Output Data/rds/nn_logo_results.RDS")
+# saveRDS(nn_lmgo_results, file="Output Data/rds/nn_lmgo_results.RDS")
+
+nn_resub_results <- readRDS("Output Data/rds/nn_resub_results.RDS")
+nn_2fold_results <- readRDS("Output Data/rds/nn_2fold_results.RDS")
+nn_5fold_results <- readRDS("Output Data/rds/nn_5fold_results.RDS")
+nn_10fold_results <- readRDS("Output Data/rds/nn_10fold_results.RDS")
+nn_logo_results <- readRDS("Output Data/rds/nn_logo_results.RDS")
+nn_lmgo_results <- readRDS("Output Data/rds/nn_lmgo_results.RDS")
+```
+
+```{r nn_different_architecture}
+library(reshape2)
+# nncv2 <- function(data, groupingstyle){
+#   if(groupingstyle=="logo"){
+#     results <- modgof <- list()
+# 
+#     for (k in 1:(length(unique(data$CDEC_ID)))){
+#       data <- data[order(data$DATE), ] # order data by timeseries
+#       h <- unique(data$CDEC_ID)[k]
+#       testset <- data[data$CDEC_ID==h, ]
+#       trainset <- data[data$CDEC_ID!=h, ]
+#       testsetpvs <- as.matrix(testset[ , c(13:(ncol(testset)-1))])
+#       trainsetpvs <- as.matrix(trainset[ , c(13:(ncol(trainset)-1))])
+#       testsetrv <- as.matrix(testset$FLOW)
+#       trainsetrv <- as.matrix(trainset$FLOW)
+#       
+#       library(reshape2)
+#       makearray <- function(tset, tsetpvs){
+#         tset_long <- melt(tset, id.vars=c("CDEC_ID", "DATE"), measure.vars=c(colnames(tsetpvs), "FLOW"), variable.name="VARS", value.name="VALUE")
+#         tset_list <- split(tset_long, tset_long$DATE)
+#         tset_array <- array(dim = c(length(tset_list), length(unique(tset_list[[1]]$CDEC_ID))*(dim(tsetpvs)[2]+1)))
+#         for(i in seq_along(tset_list)){tset_array[i, ] <- tset_list[[i]][, 4]}
+#         return(tset_array)
+#       }
+#       
+#       trainset_array <- makearray(trainset, trainsetpvs)
+#       testset_array <- makearray(testset, testsetpvs)
+#       
+#       # split into predictor variables and response variables
+#       trainsetpv_array <- trainset_array[,1:(length(unique(trainset$CDEC_ID))*dim(trainsetpvs)[2])]
+#       trainsetrv_array <- trainset_array[,(length(unique(trainset$CDEC_ID))*dim(trainsetpvs)[2]+1):dim(trainset_array)[2]]
+#       testsetpv_array <- testset_array[,1:dim(testsetpvs)[2]]
+#       testsetrv_array <- testset_array[,dim(testsetpvs)[2]+1]
+#       
+#       nnmodel <- keras_model_sequential() %>%
+#         layer_dense(units=64, activation="relu", input_shape=c(length(unique(trainset$CDEC_ID))* dim(trainsetpvs)[2])) %>%
+#         layer_dense(units=64, activation="relu") %>%
+#         layer_dense(units=length(unique(trainset$CDEC_ID)))
+#     
+#       nnmodel %>% 
+#         compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
+# 
+#       nnmodel %>%
+#         fit(trainsetpv_array, trainsetrv_array, epochs=100, verbose=1, validation_split=0.2)
+#       
+#       predictions <- nnmodel %>% predict(testsetpv_array)
+#       predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+#       results[[k]] <- cbind(obs=testsetrv_array[ , 1], pred=predictions)
+#       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+#     }
+#     names_tbd <- rownames(modgof[[1]])
+#     modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+#     rownames(modgof) <- names_tbd
+#     colnames(modgof) <- unique(data$CDEC_ID)
+#   }
+#   
+#   if(groupingstyle=="resub"){
+#     list(results=results, gof=modgof)
+#   } else if(groupingstyle=="logo"){
+#     list(results=results, gof=modgof)
+#   } else{
+#     list(results=results, gof=modgof, kf=group)
+#   }
+# }
+```
+
+### 4.4.1 LSTM
+Predictor $X$ is a 3D matrix:
+1. length of the time series
+2. the lag;
+3. the number of variables used for prediction $X$ (at least 1 for the series at a given lag). Here, it's 15 * the number of basins (9) or however many is in the training set. 
+
+Response $Y$ is a 2D matrix:
+1. length of the time series
+2. the lag;
+
+# 5.0 Post Processing 
+```{r data_results_df}
+# make a copy of the original dataframe to add the results to later
+results <- moddf
+```
+
+## 5.1 Aggregate basins - CV
+```{r results_dataframes}
+# put the logo results in their respective dataframes
+# modeltype: "lm", "glm", "rf", "nn"
+# grouping style: "resub", "2fold", "5fold", "10fold", "logo", "lmgo"
+
+pp_results <- function(resultsls, resultsdf, modeltype, groupingstyle){
+  if(groupingstyle=="resub"){
+    results_unlisted <- as.data.frame(resultsls$results)
+    resultsdf <- cbind(resultsdf, RESUBFIT=results_unlisted$pred)
+    resultsdf$RESUBRES <- resultsdf$RESUBFIT-resultsdf$FLOW # this is pred - obs
+    
+    # adding a KF column to make it consistent between groupingstyles
+    resultsdf$KF <- 1
+    colnames(resultsdf)[ncol(resultsdf)] <- "RESUBKF"
+  } 
+  
+  if(is.integer(groupingstyle)){ 
+    if(modeltype=="nn"|modeltype=="glm"){ # for GLM and NN we made a nforstitch column, use that to order instead of the usual way of using rownames
+      kftype <- paste0(as.character(groupingstyle), "FOLD")
+      results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+      results_unlisted <- results_unlisted[order(results_unlisted$nforstitch), ]
+      resultsdf <- cbind(resultsdf, FIT=results_unlisted$pred)
+      resultsdf$RES <- resultsdf$FIT-resultsdf$FLOW
+      colnames(resultsdf)[ncol(resultsdf)-1] <- paste0(kftype, "FIT")
+      colnames(resultsdf)[ncol(resultsdf)] <- paste0(kftype, "RES")
+      resultsdf$KF <- resultsls$kf
+      colnames(resultsdf)[ncol(resultsdf)] <- paste0(kftype, "KF")
+    }else{
+      kftype <- paste0(as.character(groupingstyle), "FOLD")
+      results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+      # use the kf vector to scramble the unlisted results, to match up with the observations in the results df... no need to do these, because the rownames, or I should say numbers, have been preserved. So, just order
+      index <- as.numeric(row.names(results_unlisted))
+      results_unlisted <- results_unlisted[order(index), ]
+      resultsdf <- cbind(resultsdf, FIT=results_unlisted$pred)
+      resultsdf$RES <- resultsdf$FIT-resultsdf$FLOW
+      colnames(resultsdf)[ncol(resultsdf)-1] <- paste0(kftype, "FIT")
+      colnames(resultsdf)[ncol(resultsdf)] <- paste0(kftype, "RES")
+      resultsdf$KF <- resultsls$kf
+      colnames(resultsdf)[ncol(resultsdf)] <- paste0(kftype, "KF")
+    }
+  }
+  
+  if(groupingstyle=="logo"){ # no need to use the unique CDEC_IDs vector to scramble the unlisted results because the original results dataframe is in the same order, so a simple cbind will be OK
+    results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+    resultsdf <- cbind(resultsdf, LOGOFIT=results_unlisted$pred)
+    resultsdf$LOGORES <- resultsdf$LOGOFIT-resultsdf$FLOW 
+    
+    # adding a KF column to make it consistent between groupingstyles
+    resultsdf$KF <- as.numeric(resultsdf$CDEC_ID)
+    colnames(resultsdf)[ncol(resultsdf)] <- "LOGOKF"
+  }
+  
+  if(groupingstyle=="lmgo"){
+    if(modeltype=="nn"|modeltype=="glm"){ 
+      results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+      results_unlisted <- results_unlisted[order(results_unlisted$nforstitch), ]
+      resultsdf <- cbind(resultsdf, LMGOFIT=results_unlisted$pred)
+      resultsdf$LMGORES <- resultsdf$LMGOFIT-resultsdf$FLOW
+      resultsdf <- merge(resultsdf, resultsls$kf, by="CDEC_ID")
+      colnames(resultsdf)[ncol(resultsdf)] <- "LMGOKF"
+    } else {
+      results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+      index <- as.numeric(row.names(results_unlisted))
+      results_unlisted <- results_unlisted[order(index), ]
+      resultsdf <- cbind(resultsdf, LMGOFIT=results_unlisted$pred)
+      resultsdf$LMGORES <- resultsdf$LMGOFIT-resultsdf$FLOW
+      resultsdf <- merge(resultsdf, resultsls$kf, by="CDEC_ID")
+      colnames(resultsdf)[ncol(resultsdf)] <- "LMGOKF"
+    }
+  }
+  
+  # now change column names based on modeltype
+  colnames(resultsdf)[ncol(resultsdf)-2] <- paste0(toupper(modeltype), "_", colnames(resultsdf)[ncol(resultsdf)-2])
+  colnames(resultsdf)[ncol(resultsdf)-1] <- paste0(toupper(modeltype), "_", colnames(resultsdf)[ncol(resultsdf)-1])
+  colnames(resultsdf)[ncol(resultsdf)] <- paste0(toupper(modeltype), "_", colnames(resultsdf)[ncol(resultsdf)])
+  return(resultsdf)
+}
+
+# first check to see if the dimensions match, examples below
+dim(as.data.frame(do.call("rbind", glmtwd_lmgo_results$results)))[[1]] == dim(results)[[1]]
+
+results <- pp_results(lm_resub_results, results, "lm", "resub")
+results <- pp_results(lm_2fold_results, results, "lm", 2L)
+results <- pp_results(lm_5fold_results, results, "lm", 5L)
+results <- pp_results(lm_10fold_results, results, "lm", 10L)
+results <- pp_results(lm_logo_results, results, "lm", "logo")
+results <- pp_results(lm_lmgo_results, results, "lm", "lmgo")
+
+results <- pp_results(glmtwd_resub_results, results, "glm", "resub")
+results <- pp_results(glmtwd_2fold_results, results, "glm", 2L)
+results <- pp_results(glmtwd_5fold_results, results, "glm", 5L)
+results <- pp_results(glmtwd_10fold_results, results, "glm", 10L)
+results <- pp_results(glmtwd_logo_results, results, "glm", "logo")
+results <- pp_results(glmtwd_lmgo_results, results, "glm", "lmgo")
+
+results <- pp_results(rf_resub_results, results, "rf", "resub")
+results <- pp_results(rf_2fold_results, results, "rf", 2L)
+results <- pp_results(rf_5fold_results, results, "rf", 5L)
+results <- pp_results(rf_10fold_results, results, "rf", 10L)
+results <- pp_results(rf_logo_results, results, "rf", "logo")
+results <- pp_results(rf_lmgo_results, results, "rf", "lmgo")
+
+results <- pp_results(nn_resub_results, results, "nn", "resub")
+results <- pp_results(nn_2fold_results, results, "nn", 2L)
+results <- pp_results(nn_5fold_results, results, "nn", 5L)
+results <- pp_results(nn_10fold_results, results, "nn", 10L)
+results <- pp_results(nn_logo_results, results, "nn", "logo")
+results <- pp_results(nn_lmgo_results, results, "nn", "lmgo")
+```
+
+## 5.2 GOF Post Processing
+```{r post_processing_gof_cv}
+gof_lm_resub <- gof(results$LM_RESUBFIT, results$FLOW, na.rm=TRUE)
+gof_glm_resub <- gof(results$GLM_RESUBFIT, results$FLOW, na.rm=TRUE)
+gof_rf_resub <- gof(results$RF_RESUBFIT, results$FLOW, na.rm=TRUE)
+gof_nn_resub <- gof(results$NN_RESUBFIT, results$FLOW, na.rm=TRUE)
+
+gof_lm_2fold <- gof(results$LM_2FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_glm_2fold <- gof(results$GLM_2FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_rf_2fold <- gof(results$RF_2FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_nn_2fold <- gof(results$NN_2FOLDFIT, results$FLOW, na.rm=TRUE)
+
+gof_lm_5fold <- gof(results$LM_5FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_glm_5fold <- gof(results$GLM_5FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_rf_5fold <- gof(results$RF_5FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_nn_5fold <- gof(results$NN_5FOLDFIT, results$FLOW, na.rm=TRUE)
+
+gof_lm_10fold <- gof(results$LM_10FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_glm_10fold <- gof(results$GLM_10FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_rf_10fold <- gof(results$RF_10FOLDFIT, results$FLOW, na.rm=TRUE)
+gof_nn_10fold <- gof(results$NN_10FOLDFIT, results$FLOW, na.rm=TRUE)
+
+gof_lm_logo <- gof(results$LM_LOGOFIT, results$FLOW, na.rm=TRUE)
+gof_glm_logo <- gof(results$GLM_LOGOFIT, results$FLOW, na.rm=TRUE)
+gof_rf_logo <- gof(results$RF_LOGOFIT, results$FLOW, na.rm=TRUE)
+gof_nn_logo <- gof(results$NN_LOGOFIT, results$FLOW, na.rm=TRUE)
+
+gof_lm_lmgo <- gof(results$LM_LMGOFIT, results$FLOW, na.rm=TRUE)
+gof_glm_lmgo <- gof(results$GLM_LMGOFIT, results$FLOW, na.rm=TRUE)
+gof_rf_lmgo <- gof(results$RF_LMGOFIT, results$FLOW, na.rm=TRUE)
+gof_nn_lmgo <- gof(results$NN_LMGOFIT, results$FLOW, na.rm=TRUE)
+
+gof_lm <- cbind(gof_lm_resub, gof_lm_2fold, gof_lm_5fold, gof_lm_10fold, gof_lm_logo, gof_lm_lmgo)
+gof_glm <- cbind(gof_glm_resub, gof_glm_2fold, gof_glm_5fold, gof_glm_10fold, gof_glm_logo, gof_glm_lmgo)
+gof_rf <- cbind(gof_rf_resub, gof_rf_2fold, gof_rf_5fold, gof_rf_10fold, gof_rf_logo, gof_rf_lmgo)
+gof_nn <- cbind(gof_nn_resub, gof_nn_2fold, gof_nn_5fold, gof_nn_10fold, gof_nn_logo, gof_nn_lmgo)
+
+colnames(gof_lm) <- c("LM_RESUB", "LM_2FOLD", "LM_5FOLD", "LM_10FOLD", "LM_LOGO", "LM_LMGO")
+colnames(gof_glm) <- c("GLM_RESUB", "GLM_2FOLD", "GLM_5FOLD", "GLM_10FOLD", "GLM_LOGO", "GLM_LMGO")
+colnames(gof_rf) <- c("RF_RESUB", "RF_2FOLD", "RF_5FOLD", "RF_10FOLD", "RF_LOGO", "RF_LMGO")
+colnames(gof_nn) <- c("NN_RESUB", "NN_2FOLD", "NN_5FOLD", "NN_10FOLD", "NN_LOGO", "NN_LMGO")
+
+gof_all <- as.data.frame(cbind(gof_lm, gof_glm, gof_rf, gof_nn))
+
+library(Hmisc)
+var_labels <- c("LM Resub", "LM 2 Fold", "LM 5 Fold", "LM 10 Fold", "LM Logo", "LM Lmgo", "GLM Resub", "GLM 2 Fold", "GLM 5 Fold", "GLM 10 Fold", "GLM Logo", "GLM Lmgo", "RF Resub", "RF 2 Fold", "RF 5 Fold", "RF 10 Fold", "RF Logo", "RF Lmgo", "NN Resub", "NN 2 Fold", "NN 5 Fold", "NN 10 Fold", "NN Logo", "NN Lmgo") 
+names(var_labels) <- colnames(gof_all)
+Hmisc::label(gof_all) <- lapply(names(var_labels), function(x) Hmisc::label(gof_all[,x]) = var_labels[x])
+
+# for latex documents, put this in appendix
+library(xtable)
+xtable(data.frame(gof_all))
+
+# check results
+gof_all["bR2",]
+```
+
+```{r post_processing_gof_by_basins_cv}
+gof_lm_resub <- gof_glm_resub <- gof_rf_resub <- gof_nn_resub <- list()
+gof_lm_2fold <- gof_glm_2fold <- gof_rf_2fold <- gof_nn_2fold <- list()
+gof_lm_5fold <- gof_glm_5fold <- gof_rf_5fold <- gof_nn_5fold <- list()
+gof_lm_10fold <- gof_glm_10fold <- gof_rf_10fold <- gof_nn_10fold <- list()
+gof_lm_logo <- gof_glm_logo <- gof_rf_logo <- gof_nn_logo <- list()
+gof_lm_lmgo <- gof_glm_lmgo <- gof_rf_lmgo <- gof_nn_lmgo <- list()
+
+for (r in 1:(length(unique(results$CDEC_ID)))){ 
+  h <- unique(results$CDEC_ID)[r]
+  resultsdf_sub <- results[results$CDEC_ID==h,]
+  
+  gof_lm_resub[[r]] <- gof(resultsdf_sub$LM_RESUBFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_glm_resub[[r]] <- gof(resultsdf_sub$GLM_RESUBFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_rf_resub[[r]] <- gof(resultsdf_sub$RF_RESUBFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_resub[[r]] <- gof(resultsdf_sub$NN_RESUBFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  
+  gof_lm_2fold[[r]] <- gof(resultsdf_sub$LM_2FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_glm_2fold[[r]] <- gof(resultsdf_sub$GLM_2FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_rf_2fold[[r]] <- gof(resultsdf_sub$RF_2FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_2fold[[r]] <- gof(resultsdf_sub$NN_2FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  
+  gof_lm_5fold[[r]] <- gof(resultsdf_sub$LM_5FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_glm_5fold[[r]] <- gof(resultsdf_sub$GLM_5FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_rf_5fold[[r]] <- gof(resultsdf_sub$RF_5FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_5fold[[r]] <- gof(resultsdf_sub$NN_5FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  
+  gof_lm_10fold[[r]] <- gof(resultsdf_sub$LM_10FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_glm_10fold[[r]] <- gof(resultsdf_sub$GLM_10FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_rf_10fold[[r]] <- gof(resultsdf_sub$RF_10FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_10fold[[r]] <- gof(resultsdf_sub$NN_10FOLDFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  
+  gof_lm_logo[[r]] <- gof(resultsdf_sub$LM_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_glm_logo[[r]] <- gof(resultsdf_sub$GLM_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_rf_logo[[r]] <- gof(resultsdf_sub$RF_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_logo[[r]] <- gof(resultsdf_sub$NN_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  
+  gof_lm_lmgo[[r]] <- gof(resultsdf_sub$LM_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_glm_lmgo[[r]] <- gof(resultsdf_sub$GLM_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_rf_lmgo[[r]] <- gof(resultsdf_sub$RF_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  gof_nn_lmgo[[r]] <- gof(resultsdf_sub$NN_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+}
+
+names_tbd <- rownames(gof_lm_resub[[1]])
+gof_lm_resub_by_basins <- data.frame(matrix(unlist(gof_lm_resub), nrow=length(gof_lm_resub[[1]]), byrow=FALSE))
+gof_glm_resub_by_basins <- data.frame(matrix(unlist(gof_glm_resub), nrow=length(gof_glm_resub[[1]]), byrow=FALSE))
+gof_rf_resub_by_basins <- data.frame(matrix(unlist(gof_rf_resub), nrow=length(gof_rf_resub[[1]]), byrow=FALSE))
+gof_nn_resub_by_basins <- data.frame(matrix(unlist(gof_nn_resub), nrow=length(gof_nn_resub[[1]]), byrow=FALSE))
+gof_lm_2fold_by_basins <- data.frame(matrix(unlist(gof_lm_2fold), nrow=length(gof_lm_2fold[[1]]), byrow=FALSE))
+gof_glm_2fold_by_basins <- data.frame(matrix(unlist(gof_glm_2fold), nrow=length(gof_glm_2fold[[1]]), byrow=FALSE))
+gof_rf_2fold_by_basins <- data.frame(matrix(unlist(gof_rf_2fold), nrow=length(gof_rf_2fold[[1]]), byrow=FALSE))
+gof_nn_2fold_by_basins <- data.frame(matrix(unlist(gof_nn_2fold), nrow=length(gof_nn_2fold[[1]]), byrow=FALSE))
+gof_lm_5fold_by_basins <- data.frame(matrix(unlist(gof_lm_5fold), nrow=length(gof_lm_5fold[[1]]), byrow=FALSE))
+gof_glm_5fold_by_basins <- data.frame(matrix(unlist(gof_glm_5fold), nrow=length(gof_glm_5fold[[1]]), byrow=FALSE))
+gof_rf_5fold_by_basins <- data.frame(matrix(unlist(gof_rf_5fold), nrow=length(gof_rf_5fold[[1]]), byrow=FALSE))
+gof_nn_5fold_by_basins <- data.frame(matrix(unlist(gof_nn_5fold), nrow=length(gof_nn_5fold[[1]]), byrow=FALSE))
+gof_lm_10fold_by_basins <- data.frame(matrix(unlist(gof_lm_10fold), nrow=length(gof_lm_10fold[[1]]), byrow=FALSE))
+gof_glm_10fold_by_basins <- data.frame(matrix(unlist(gof_glm_10fold), nrow=length(gof_glm_10fold[[1]]), byrow=FALSE))
+gof_rf_10fold_by_basins <- data.frame(matrix(unlist(gof_rf_10fold), nrow=length(gof_rf_10fold[[1]]), byrow=FALSE))
+gof_nn_10fold_by_basins <- data.frame(matrix(unlist(gof_nn_10fold), nrow=length(gof_nn_10fold[[1]]), byrow=FALSE))
+gof_lm_logo_by_basins <- data.frame(matrix(unlist(gof_lm_logo), nrow=length(gof_lm_logo[[1]]), byrow=FALSE))
+gof_glm_logo_by_basins <- data.frame(matrix(unlist(gof_glm_logo), nrow=length(gof_glm_logo[[1]]), byrow=FALSE))
+gof_rf_logo_by_basins <- data.frame(matrix(unlist(gof_rf_logo), nrow=length(gof_rf_logo[[1]]), byrow=FALSE))
+gof_nn_logo_by_basins <- data.frame(matrix(unlist(gof_nn_logo), nrow=length(gof_nn_logo[[1]]), byrow=FALSE))
+gof_lm_lmgo_by_basins <- data.frame(matrix(unlist(gof_lm_lmgo), nrow=length(gof_lm_lmgo[[1]]), byrow=FALSE))
+gof_glm_lmgo_by_basins <- data.frame(matrix(unlist(gof_glm_lmgo), nrow=length(gof_glm_lmgo[[1]]), byrow=FALSE))
+gof_rf_lmgo_by_basins <- data.frame(matrix(unlist(gof_rf_lmgo), nrow=length(gof_rf_lmgo[[1]]), byrow=FALSE))
+gof_nn_lmgo_by_basins <- data.frame(matrix(unlist(gof_nn_lmgo), nrow=length(gof_nn_lmgo[[1]]), byrow=FALSE))
+
+rownames(gof_lm_resub_by_basins) <- rownames(gof_glm_resub_by_basins) <- rownames(gof_rf_resub_by_basins) <- rownames(gof_nn_resub_by_basins) <- rownames(gof_lm_2fold_by_basins) <- rownames(gof_glm_2fold_by_basins) <- rownames(gof_rf_2fold_by_basins) <- rownames(gof_nn_2fold_by_basins) <- rownames(gof_lm_5fold_by_basins) <- rownames(gof_glm_5fold_by_basins) <- rownames(gof_rf_5fold_by_basins) <- rownames(gof_nn_5fold_by_basins) <- rownames(gof_lm_10fold_by_basins) <- rownames(gof_glm_10fold_by_basins) <- rownames(gof_rf_10fold_by_basins) <- rownames(gof_nn_10fold_by_basins) <- rownames(gof_lm_logo_by_basins) <- rownames(gof_glm_logo_by_basins) <- rownames(gof_rf_logo_by_basins) <- rownames(gof_nn_logo_by_basins) <- rownames(gof_lm_lmgo_by_basins) <- rownames(gof_glm_lmgo_by_basins) <- rownames(gof_rf_lmgo_by_basins) <- rownames(gof_nn_lmgo_by_basins) <- names_tbd
+  
+colnames(gof_lm_resub_by_basins) <- colnames(gof_glm_resub_by_basins) <- colnames(gof_rf_resub_by_basins) <- colnames(gof_nn_resub_by_basins) <- colnames(gof_lm_2fold_by_basins) <- colnames(gof_glm_2fold_by_basins) <- colnames(gof_rf_2fold_by_basins) <- colnames(gof_nn_2fold_by_basins) <- colnames(gof_lm_5fold_by_basins) <- colnames(gof_glm_5fold_by_basins) <- colnames(gof_rf_5fold_by_basins) <- colnames(gof_nn_5fold_by_basins) <- colnames(gof_lm_10fold_by_basins) <- colnames(gof_glm_10fold_by_basins) <- colnames(gof_rf_10fold_by_basins) <- colnames(gof_nn_10fold_by_basins) <- colnames(gof_lm_logo_by_basins) <- colnames(gof_glm_logo_by_basins) <- colnames(gof_rf_logo_by_basins) <- colnames(gof_nn_logo_by_basins) <- colnames(gof_lm_lmgo_by_basins) <- colnames(gof_glm_lmgo_by_basins) <- colnames(gof_rf_lmgo_by_basins) <- colnames(gof_nn_lmgo_by_basins) <- unique(results$CDEC_ID)
+  
+remove(names_tbd)
+```
+
+# 6.0 Plots
+
+## 6.1 GOF Comparisons
+```{r mof_comp_plots}
+# CV plot, just for bR2
+goftablet <- data.frame(t(gof_all))
+goftablet$MODELTYPE <- factor(c("LM", "LM", "LM", "LM", "LM", "LM", "GLM", "GLM", "GLM", "GLM", "GLM", "GLM", "RF", "RF", "RF", "RF", "RF", "RF", "NN", "NN", "NN", "NN", "NN", "NN"), levels= c("LM", "GLM", "RF", "NN"))
+goftablet$CVTYPE <- rep(c("RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO"), times=4)
+goftablet$COLORS <- c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])[goftablet$MODELTYPE]
+
+png('Output Data/rplot41_gof_bR2.png', width=6.5, height=4, units="in", pointsize=8, res=1200)
+  plottoprint <- ggplot(goftablet)+
+    #geom_rect(aes(xmin=0.2, xmax=0.5, ymin=1, ymax=24 col=cbpblack[2], alpha=0.2))+
+    geom_point(aes(x = bR2, y = reorder(rownames(goftablet), bR2), color=MODELTYPE, shape=CVTYPE))+
+    scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
+    theme_bw(base_size = 8) +
+    annotate("rect", xmin = 0.2, xmax = 0.5, ymin = 1, ymax = 24, fill= "grey55", alpha = 0.5) +
+    annotate("rect", xmin = 0.5, xmax = 0.65, ymin = 1, ymax = 24, fill= "grey70", alpha = 0.5) +
+    annotate("rect", xmin = 0.65, xmax = 0.75, ymin = 1, ymax = 24, fill= "grey85", alpha = 0.5) +
+    annotate("rect", xmin = 0.75, xmax = 1.0, ymin = 1, ymax = 24, fill= "grey95", alpha = 0.5) +
+    geom_text(aes(x = bR2, y = reorder(rownames(goftablet), bR2), label=bR2), nudge_x = 0.03, size=3) +
+    geom_text(aes(x= 0.35, y=24, label="Unsatisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.575, y=24, label="Satisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.7, y=1, label="Good"), size=3, hjust="center")+
+    geom_text(aes(x= 0.875, y=1, label="Very Good"), size=3, hjust="center")+
+    ylab("") +
+    xlab("Bias-Corrected Coefficient of Determination (-)") +
+    theme(legend.title = element_blank(), legend.text=element_text(size=10), text=element_text(size=10), legend.position = "right", legend.box = "vertical", axis.text.y = element_text(colour=goftablet[order(goftablet$bR2),]$COLOR))+
+    scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])) +  
+    scale_shape_manual(breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"), values=c(2, 8, 5, 15, 16, 4)) + # to order the legend
+    guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+  print(plottoprint)
+dev.off()
+
+# try putting a bracket around NN and RF and call them out, not doing this just yet
+# library(grid)
+# library(pBrackets) 
+# 
+# png('Output Data/rplot41_gof_bR2.png', width=6.5, height=4, units="in", pointsize=8, res=1200)
+# plottoprint
+# grid.locator(unit="native") 
+# grid.brackets(2200, 28,   2300, 28, lwd=2, col="red")
+# dev.off()
+
+# # BS plot, just for bR2
+# goftablet_bs <- data.frame(t(gof_all_bs))
+# goftablet_bs$MODELTYPE <- factor(c("LM", "LM", "LM", "GLM", "GLM", "GLM", "RF", "RF", "RF", "NN", "NN", "NN"), levels= c("LM", "GLM", "RF", "NN"))
+# goftablet_bs$BSTYPE <- rep(c("IID", "BBG", "BBMG"), times=4)
+# goftablet_bs$COLORS <- c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])[goftablet_bs$MODELTYPE]
+# 
+# png('Output Data/rplot41_gof_bR2_bs.png', width=6.5, height=2, units="in", pointsize=8, res=1200)
+#   ggplot(goftablet_bs)+
+#     geom_point(aes(x = bR2, y = reorder(rownames(goftablet_bs), bR2), color=MODELTYPE, shape=BSTYPE))+
+#     scale_y_discrete(labels=var_labels_bs[match(rownames(goftablet_bs), names(var_labels_bs))])+
+#     theme_bw(base_size = 8) +
+#     annotate("rect", xmin = 0.2, xmax = 0.5, ymin = 1, ymax = 12, fill= "grey55", alpha = 0.5) +
+#     annotate("rect", xmin = 0.5, xmax = 0.65, ymin = 1, ymax = 12, fill= "grey70", alpha = 0.5) +
+#     annotate("rect", xmin = 0.65, xmax = 0.75, ymin = 1, ymax = 12, fill= "grey85", alpha = 0.5) +
+#     annotate("rect", xmin = 0.75, xmax = 1.0, ymin = 1, ymax = 12, fill= "grey95", alpha = 0.5) +
+#     geom_text(aes(x = bR2, y = reorder(rownames(goftablet_bs), bR2), label=round(bR2, digits=2)), nudge_x = 0.03, size=3)+
+#     geom_text(aes(x= 0.35, y=12, label="Unsatisfactory"), size=3, hjust="center")+
+#     geom_text(aes(x= 0.575, y=12, label="Satisfactory"), size=3, hjust="center")+
+#     geom_text(aes(x= 0.7, y=1, label="Good"), size=3, hjust="center")+
+#     geom_text(aes(x= 0.875, y=1, label="Very Good"), size=3, hjust="center")+
+#     ylab("") +
+#     xlab("Bias-Corrected Coefficient of Determination (-)") +
+#     theme(legend.title = element_blank(), legend.text=element_text(size=10), text=element_text(size=10), legend.position = "right", legend.box = "vertical", axis.text.y = element_text(colour=goftablet_bs[order(goftablet_bs$bR2),]$COLOR))+
+#     scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])) +
+#     scale_shape_manual(breaks = c("IID", "BBG", "BBMG"), values=c(16, 2, 4)) + # to order the legend
+#     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
+# dev.off()
+```
+
+```{r mof_comp_ggplots} 
+# for CV
+png('Output Data/rplot42_gof_bR2.png', width=6.5, height=2, units="in", pointsize=8, res=1200)
+  plottoprint <- ggplot(goftablet, aes(x=MODELTYPE, y=bR2, fill=CVTYPE))+
+    geom_point(aes(group=MODELTYPE, col=CVTYPE),position=position_jitterdodge(jitter.width = 0.25, jitter.height = 0, dodge.width = 0.85, seed = NA), alpha=0.8, show.legend=TRUE) +
+    coord_flip() +
+    theme_bw(base_size = 8) +
+    ylab("Bias-Corrected Coefficient of Determination (-)") +
+    xlab("") +
+    theme(legend.title = element_blank(), legend.text=element_text(size=10), text=element_text(size=10), legend.position = "right")+
+    scale_colour_manual(aesthetics = c("colour", "fill"), values=c(cbpblack[3], cbpblack[5], cbpblack[4], cbpblack[6], cbpblack[8], cbpblack[2]), breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))  # to order the legend
+  print(plottoprint)
+dev.off()
+```
+
+## 6.2 Observed vs. Predicted 
+```{r obsvspred_forpaper_ggplot}
+# to replace the base plots above
+library(reshape2)
+mastercv_lm <- results[,c("CDEC_ID", "FLOW", "LM_RESUBFIT", "LM_2FOLDFIT", "LM_5FOLDFIT", "LM_10FOLDFIT", "LM_LOGOFIT", "LM_LMGOFIT")]
+mastercv_glm <- results[,c ("CDEC_ID", "FLOW", "GLM_RESUBFIT", "GLM_2FOLDFIT", "GLM_5FOLDFIT", "GLM_10FOLDFIT", "GLM_LOGOFIT", "GLM_LMGOFIT")]
+mastercv_rf <- results[,c("CDEC_ID","FLOW", "RF_RESUBFIT", "RF_2FOLDFIT", "RF_5FOLDFIT", "RF_10FOLDFIT", "RF_LOGOFIT", "RF_LMGOFIT")]
+mastercv_nn <- results[,c("CDEC_ID", "FLOW", "NN_RESUBFIT", "NN_2FOLDFIT", "NN_5FOLDFIT", "NN_10FOLDFIT", "NN_LOGOFIT", "NN_LMGOFIT")]
+
+mastercv_lm$MODELTYPE <- "LM"
+mastercv_glm$MODELTYPE <- "GLM"
+mastercv_rf$MODELTYPE <- "RF"
+mastercv_nn$MODELTYPE <- "NN"
+
+colnames(mastercv_lm)[1:8] <- colnames(mastercv_glm)[1:8] <- colnames(mastercv_rf)[1:8] <- colnames(mastercv_nn)[1:8] <- c("CDEC_ID", "OBS", "RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO")
+
+# just do NN for now, so don't join
+# master_cv <- rbind(mastercv_lm, mastercv_glm, mastercv_rf, mastercv_nn)
+master_cv_melted <- melt(mastercv_nn, measure.vars= c("RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO"), variable.name="GROUPINGSTYLE", value.name="PRED")
+master_cv_melted$MODELTYPE <- factor(master_cv_melted$MODELTYPE, levels=c("LM", "GLM", "RF", "NN"))
+master_cv_melted$GROUPINGSTYLE <- factor(master_cv_melted$GROUPINGSTYLE, levels=c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))
+
+pretty_facet_labels <- c("Resubstitution", "Random 10 Fold", "Random 5 Fold", "Random 2 Fold", "Leave One Group Out (LOGO)", "Leave Multiple Groups Out (LMGO)")
+names(pretty_facet_labels) <- c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO")
+
+library(ggpmisc)
+png('Output Data/rplot43_obsvspred_all_nn.png', width=6.5, height=8, units="in", pointsize=8, res=1200)
+  plottoprint <- ggplot(master_cv_melted, aes(x=OBS, y=PRED)) +
+    geom_point(aes(group=CDEC_ID, colour=CDEC_ID, shape=CDEC_ID)) +
+    geom_smooth(method="lm", se=FALSE, color="black")+
+    stat_poly_eq(formula = y ~ x, 
+                aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                parse = TRUE) +
+    geom_abline(slope=1, intercept=0, color="black", linetype=3)+
+    facet_wrap(~GROUPINGSTYLE, ncol=2, labeller=labeller(GROUPINGSTYLE=pretty_facet_labels))+
+    scale_discrete_manual(aesthetics = "color", values=c(cbpblack, cbpgrey[1]), name="Basin")+
+    scale_discrete_manual(aesthetics= "shape", values=c(1:9), name="Basin") +
+    labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
+    theme(legend.text=element_text(size=10), text=element_text(size=10))+
+    theme_bw(base_size = 8)
+  print(plottoprint)
+dev.off()
+```
+
+## 6.3 Density Plots
+```{r error_density_plot}
+mastercv_lm <- results[,c("FLOW", "LM_RESUBFIT", "LM_2FOLDFIT", "LM_5FOLDFIT", "LM_10FOLDFIT", "LM_LOGOFIT", "LM_LMGOFIT")]
+mastercv_glm <- results[,c("FLOW", "GLM_RESUBFIT", "GLM_2FOLDFIT", "GLM_5FOLDFIT", "GLM_10FOLDFIT", "GLM_LOGOFIT", "GLM_LMGOFIT")]
+mastercv_rf <- results[,c("FLOW", "RF_RESUBFIT", "RF_2FOLDFIT", "RF_5FOLDFIT", "RF_10FOLDFIT", "RF_LOGOFIT", "RF_LMGOFIT")]
+mastercv_nn <- results[,c("FLOW", "NN_RESUBFIT", "NN_2FOLDFIT", "NN_5FOLDFIT", "NN_10FOLDFIT", "NN_LOGOFIT", "NN_LMGOFIT")]
+
+mastercv_lm$MODELTYPE <- "LM"
+mastercv_glm$MODELTYPE <- "GLM"
+mastercv_rf$MODELTYPE <- "RF"
+mastercv_nn$MODELTYPE <- "NN"
+
+colnames(mastercv_lm)[1:7] <- colnames(mastercv_glm)[1:7] <- colnames(mastercv_rf)[1:7] <- colnames(mastercv_nn)[1:7] <- c("OBS", "RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO")
+
+master_cv <- rbind(mastercv_lm, mastercv_glm, mastercv_rf, mastercv_nn)
+master_cv_melted <- melt(master_cv, measure.vars= c("RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO"), variable.name="GROUPINGSTYLE", value.name="FLOW")
+master_cv_melted$MODELTYPE <- factor(master_cv_melted$MODELTYPE, levels=c("LM", "GLM", "RF", "NN"))
+master_cv_melted$GROUPINGSTYLE <- factor(master_cv_melted$GROUPINGSTYLE, levels=c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))
+
+MODELTYPE.labs <- c("Linear Model (LM)", "Generalized Linear Model (GLM)", "Random Forest (RF)", "Neural Network (NN)")
+names(MODELTYPE.labs) <- c("LM", "GLM", "RF", "NN")
+
+png('Output Data/rplot47_density_all.png', width=3.25*2, height=2.85*2, units="in", pointsize=8, res=1200)
+  plottoprint <- ggplot(master_cv_melted) +
+    geom_density(aes(x=FLOW, group=GROUPINGSTYLE, colour=GROUPINGSTYLE, linetype=GROUPINGSTYLE), position=position_dodge(width=0.2)) +
+    facet_wrap(~MODELTYPE, labeller=labeller(MODELTYPE=MODELTYPE.labs))+
+    scale_discrete_manual(aesthetics = "color", values=c(cbpblack[2], cbpblack[3], cbpblack[4], cbpblack[5], cbpblack[8], cbpblack[6]), name="Pred", breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))+ 
+    scale_linetype_manual(values=c("dashed", "dotted", "dotdash", "longdash", "twodash", "solid"), labels=c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"), name="Pred", breaks=c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))+
+    geom_density(aes(x=OBS, fill=""), alpha=0.2) +
+    scale_discrete_manual(aesthetics = "fill", values=cbpblack[1], name="Obs")+
+    guides(fill = guide_legend(override.aes = list(alpha = 0.2)))+
+    scale_x_continuous(trans="log10")+
+    labs(x ="Unimpaired Flow (AF/m)", y = "Density or Frequency of Occurance (%)", color = "")+
+    annotation_logticks(sides="b")+
+    theme(legend.text=element_text(size=10), text=element_text(size=10))+
+    theme_bw(base_size = 8)
+  print(plottoprint)
+dev.off()
+```
+
+## 6.4 Map Plots
+```{r error_mapplots}
+# modeltype can be: "lm", "glm", "rf", "nn"
+library(RColorBrewer)
+library(lattice)
+library(grid)
+
+br2map <- function(gof_results, modelform, groupingstyle, datatype){ 
+  basinsc <- sptdf
+  results <- data.frame(t(gof_results))
+  results$CDEC_ID <- rownames(results)
+  basinsc <- merge(basinsc, results, by="CDEC_ID", all=TRUE)
+  counties <- list(first=TRUE, "sp.polygons", cacounties, fill="gray88", col="white")
+
+  png(paste0('Output Data/rplot415_br2map_', modelform, "_", groupingstyle, "_", datatype , '.png'), width=3.25, height=3, units="in", pointsize=8, res=1200)
+  par(mar=c(0,0,0,0)+0.1, cex=1)
+  mycolors <- colorRampPalette(c(cbpblack[2],cbpblack[4],cbpblack[6]))
+  tbdspplot <- spplot(basinsc["bR2"], xlim = c(caboundary@bbox["x", "min"], caboundary@bbox["x", "max"]), ylim = c(caboundary@bbox["y", "min"], caboundary@bbox["y", "max"]), cex=0.8, sp.layout=counties, col.regions = mycolors(100), colorkey = list(right = list( # see ?levelplot in package trellis, argument colorkey:
+                      fun = draw.colorkey, 
+                      args = list(
+                             key = list(
+                                  at = seq(0, 1.0, 1/100), # colour breaks
+                                  col = mycolors(100), # colours
+                                  labels = list(
+                                      at = seq(0, 1.0, 0.2),
+                                      labels = seq(0, 1.0, 0.2)
+                                      )
+                                   )
+                              )
+                      )
+          )
+  )
+  print(tbdspplot)
+  grid.text("bR2(-)", 0.57, 0.88)
+  dev.off()
+}
+
+br2map(gof_nn_resub_by_basins, "nn", "resub", "agg")
+br2map(gof_nn_2fold_by_basins, "nn", "2fold", "agg")
+br2map(gof_nn_5fold_by_basins, "nn", "5fold", "agg")
+br2map(gof_nn_10fold_by_basins, "nn", "10fold", "agg")
+br2map(gof_nn_logo_by_basins, "nn", "logo", "agg")
+br2map(gof_nn_lmgo_by_basins, "nn", "lmgo", "agg")
+```
+
+## 6.5 Dotcharts
+```{r error_hierarchy_plots_cv}
+# groupingstyle comparisons by basin
+library(reshape2)
+gofdotchart <- function(gof_results_resub, gof_results_2fold, gof_results_5fold, gof_results_10fold, gof_results_logo, gof_results_lmgo, modeltype, fitofinterest){
+  tgof_results_resub <- data.frame(t(gof_results_resub))
+  tgof_results_resub$CDEC_ID <- rownames(tgof_results_resub)
+  basinsc <- sptdf@data
+  basinsc <- merge(basinsc, tgof_results_resub, by="CDEC_ID", all=TRUE)
+  basinsc$GROUPINGSTYLE <- "RESUB"
+  
+  tgof_results_2fold <- data.frame(t(gof_results_2fold))
+  tgof_results_2fold$CDEC_ID <- rownames(tgof_results_2fold)
+  basinsc2 <- sptdf@data
+  basinsc2 <- merge(basinsc2, tgof_results_2fold, by="CDEC_ID", all=TRUE)
+  basinsc2$GROUPINGSTYLE <- "2FOLD"
+  
+  tgof_results_5fold <- data.frame(t(gof_results_5fold))
+  tgof_results_5fold$CDEC_ID <- rownames(tgof_results_5fold)
+  basinsc3 <- sptdf@data
+  basinsc3 <- merge(basinsc3, tgof_results_5fold, by="CDEC_ID", all=TRUE)
+  basinsc3$GROUPINGSTYLE <- "5FOLD"
+  
+  tgof_results_10fold <- data.frame(t(gof_results_10fold))
+  tgof_results_10fold$CDEC_ID <- rownames(tgof_results_10fold)
+  basinsc4 <- sptdf@data
+  basinsc4 <- merge(basinsc4, tgof_results_10fold, by="CDEC_ID", all=TRUE)
+  basinsc4$GROUPINGSTYLE <- "10FOLD"
+  
+  tgof_results_logo <- data.frame(t(gof_results_logo))
+  tgof_results_logo$CDEC_ID <- rownames(tgof_results_logo)
+  basinsc5 <- sptdf@data
+  basinsc5 <- merge(basinsc5, tgof_results_logo, by="CDEC_ID", all=TRUE)
+  basinsc5$GROUPINGSTYLE <- "LOGO"
+  
+  tgof_results_lmgo <- data.frame(t(gof_results_lmgo))
+  tgof_results_lmgo$CDEC_ID <- rownames(tgof_results_lmgo)
+  basinsc6 <- sptdf@data
+  basinsc6 <- merge(basinsc6, tgof_results_lmgo, by="CDEC_ID", all=TRUE)
+  basinsc6$GROUPINGSTYLE <- "LMGO"
+
+  if(fitofinterest=="ME"){
+    fitofinterestlabel <- "Mean Error (AF)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="ME",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="ME",], na.rm=TRUE))
+  } else if(fitofinterest=="MAE"){
+    fitofinterestlabel <- "Mean Absolute Error (AF)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="MAE",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="MAE",], na.rm=TRUE))
+  } else if(fitofinterest=="MSE"){
+    fitofinterestlabel <- "Mean Squared Error (AF^2)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="MSE",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="MSE",], na.rm=TRUE))
+  } else if(fitofinterest=="RMSE"){
+    fitofinterestlabel <- "Root Mean Squared Error (AF)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="RMSE",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="RMSE",], na.rm=TRUE))
+  } else if(fitofinterest=="NRMSE.."){
+    fitofinterestlabel <- "Normalized Root Mean Squared Error (AF^2)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="NRMSE..",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="NRMSE..",], na.rm=TRUE))
+  } else if(fitofinterest=="PBIAS.."){
+    fitofinterestlabel <- "Percent Bias (-)"
+    maxxlim <- max(1.4*max(basinscm[basinscm$GOF=="PBIAS..",], na.rm=TRUE), 1.4*max(basinscm[basinscm$GOF=="PBIAS..",], na.rm=TRUE))
+  } else if(fitofinterest=="RSR"){
+    fitofinterestlabel <- "RMSE to Standard Deviation of Observations Ratio (-)"
+    maxxlim <- 67
+  } else if(fitofinterest=="NSE"){
+    fitofinterestlabel <- "Nash-Sutcliffe Efficiency (-)"
+    maxxlim <- 10
+    # minxlim <- 7*minxlim
+  } else if(fitofinterest=="rSD"){
+    fitofinterestlabel <- "Ratio of Standard Deviations (-)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="rSD",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="rSD",], na.rm=TRUE))
+  } else if(fitofinterest=="mNSE"){
+    fitofinterestlabel <- "Modified Nash-Sutcliffe Efficiency (-)"
+    maxxlim <- 5
+  } else if(fitofinterest=="rNSE"){
+    fitofinterestlabel <- "Relative Nash-Sutcliffe Efficiency (-)"
+    maxxlim <- 5e5
+  } else if(fitofinterest=="d"){
+    fitofinterestlabel <- "Index of Agreement (-)"
+    maxxlim <- max(1.05*max(basinscm[basinscm$GOF=="d",], na.rm=TRUE), 1.05*max(basinscm[basinscm$GOF=="d",], na.rm=TRUE))
+  } else if(fitofinterest=="md"){
+    fitofinterestlabel <- "Modified Index of Agreement (-)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="md",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="md",], na.rm=TRUE))
+  } else if(fitofinterest=="rd"){
+    fitofinterestlabel <- "Relative Index of Agreement (-)"
+    maxxlim <- 100
+  } else if(fitofinterest=="cp"){
+    fitofinterestlabel <- "Persistence Index (-)"
+    maxxlim <- 200
+  } else if(fitofinterest=="r"){
+    fitofinterestlabel <- "Pearson Correlation coefficient (-)"
+    maxxlim <- max(1.1*max(basinscm[basinscm$GOF=="r",], na.rm=TRUE), 1.1*max(basinscm[basinscm$GOF=="r",], na.rm=TRUE))
+  } else if(fitofinterest=="R2"){
+    fitofinterestlabel <- "Coefficient of Determination (-)"
+    maxxlim <- 1.0
+  } else if(fitofinterest=="bR2"){
+    fitofinterestlabel <- "Bias-Corrected Coefficient of Determination (-)"
+    maxxlim <- 1.0
+    minxlim <- -0.05
+  } else if(fitofinterest=="KGE"){
+    fitofinterestlabel <- "Kling-Gupta Efficiency (-)"
+    maxxlim <- 10
+  } else if(fitofinterest=="VE"){
+    fitofinterestlabel <- "Volumetric Efficiency (AF)"
+    maxxlim <- 6
+  } else{
+    print("Input a measure of fit provided by the gof function in HydroGOF package!")
+  }
+  
+  basinscr <- melt(basinsc, id.vars=c("CDEC_ID", "GROUPINGSTYLE"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc2r <- melt(basinsc2, id.vars=c("CDEC_ID", "GROUPINGSTYLE"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc3r <- melt(basinsc3, id.vars=c("CDEC_ID", "GROUPINGSTYLE"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc4r <- melt(basinsc4, id.vars=c("CDEC_ID", "GROUPINGSTYLE"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc5r <- melt(basinsc5, id.vars=c("CDEC_ID", "GROUPINGSTYLE"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  basinsc6r <- melt(basinsc6, id.vars=c("CDEC_ID", "GROUPINGSTYLE"), variable.name = "GOF", value.name="VALUE", measure.vars = fitofinterest)
+  
+  # order the basins based on LOGO values, decreasing
+  orderrownums <- as.numeric(row.names(basinsc5r[order(basinsc5r$VALUE, decreasing=TRUE), ]))
+  basinscr <- basinscr[orderrownums, ]
+  basinsc2r <- basinsc2r[orderrownums, ]
+  basinsc3r <- basinsc3r[orderrownums, ]
+  basinsc4r <- basinsc4r[orderrownums, ]
+  basinsc5r <- basinsc5r[orderrownums, ]
+  basinsc6r <- basinsc6r[orderrownums, ]
+  
+  # bind aacross the different grouping styles
+  basinscm <- rbind(basinscr, basinsc2r, basinsc3r, basinsc4r, basinsc5r, basinsc6r)
+  basinscm$GROUPINGSTYLE <- factor(basinscm$GROUPINGSTYLE, levels = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))
+  basinscm$CDEC_ID <- factor(basinscm$CDEC_ID)
+  
+  png(paste0('Output Data/rplot416_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=4, units="in", pointsize=8, res=1200)
+    plottoprint <- ggplot(data=basinscm, aes(x=VALUE, y=CDEC_ID)) +
+      geom_point(aes(shape=GROUPINGSTYLE, color=GROUPINGSTYLE), size=4)+
+      scale_shape_manual(breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"), values=c(4, 2, 5, 8, 16, 15)) + 
+      scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[2], cbpblack[3], cbpblack[4], cbpblack[5], cbpblack[8], cbpblack[6]), breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO")) +
+      labs(x=fitofinterestlabel, y="")+
+      theme_bw()+
+      theme(legend.position="bottom", legend.title = element_blank())+
+      guides(color = guide_legend(nrow = 1), shape= guide_legend(nrow = 1))
+    print(plottoprint)
+  dev.off()
+}
+
+gofdotchart(gof_lm_resub_by_basins, gof_lm_2fold_by_basins, gof_lm_5fold_by_basins, gof_lm_10fold_by_basins, gof_lm_logo_by_basins, gof_lm_lmgo_by_basins, "lm", "bR2")
+gofdotchart(gof_glm_resub_by_basins, gof_glm_2fold_by_basins, gof_glm_5fold_by_basins, gof_glm_10fold_by_basins, gof_glm_logo_by_basins, gof_glm_lmgo_by_basins, "glm", "bR2")
+gofdotchart(gof_rf_resub_by_basins, gof_rf_2fold_by_basins, gof_rf_5fold_by_basins, gof_rf_10fold_by_basins, gof_rf_logo_by_basins, gof_rf_lmgo_by_basins, "rf", "bR2")
+gofdotchart(gof_nn_resub_by_basins, gof_nn_2fold_by_basins, gof_nn_5fold_by_basins, gof_nn_10fold_by_basins, gof_nn_logo_by_basins, gof_nn_lmgo_by_basins, "nn", "bR2")
+```
+
+## 6.6 Boxplots
+consider adding a boxplot band on each of the mean points in the dotchart for the BS runs
+
+## 6.7 Time Series
+```{r tsplots_comp}
+for (r in 1:(length(unique(results$CDEC_ID)))){ 
+  # plot time series by basin
+  h <- unique(results$CDEC_ID)[r]
+  resultsdf_sub <- results[results$CDEC_ID==h,]
+
+  # convert the units. AREASQM is in square miles, PPT is in mm/day, FLOW is in cfs 
+  watershedArea_sqft <- resultsdf_sub$AREASQM[1]*(5280)^2
+  resultsdf_sub$precip_ft <- resultsdf_sub$PPT/10/2.54/12
+  resultsdf_sub$precip_cuft <- resultsdf_sub$precip_ft * watershedArea_sqft
+  resultsdf_sub$precip_cfs <- resultsdf_sub$precip_cuft/24/60/60/25 # arbitrary 25 to get the scale right
+  resultsdf_sub$discharge_cfs <- resultsdf_sub$FLOW # no conversion needed
+  
+  resultsdf_sub$LMLOGOFIT_cfs <- resultsdf_sub$LM_LOGOFIT
+  resultsdf_sub$GLMLOGOFIT_cfs <- resultsdf_sub$GLM_LOGOFIT
+  resultsdf_sub$RFLOGOFIT_cfs <- resultsdf_sub$RF_LOGOFIT
+  resultsdf_sub$NNLOGOFIT_cfs <- resultsdf_sub$NN_LOGOFIT
+  
+  # remove NAs here?
+  resultsdf_sub <- na.omit(resultsdf_sub)
+  
+  # calculate the range needed to avoid having your hyetograph and hydrograph overlap 
+  maxFlow <- max(max(resultsdf_sub$discharge_cfs), 
+                 max(resultsdf_sub$LMLOGOFIT_cfs, na.rm=TRUE), 
+                 max(resultsdf_sub$GLMLOGOFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$RFLOGOFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NNLOGOFIT_cfs, na.rm=TRUE)) 
+  maxRange <- 1.1*(max(resultsdf_sub$precip_cfs) + maxFlow)
+
+  # create a function to backtransform the axis labels for precipitation, for some reason multiplying it by -1 fixed the labels, kinda hacky but whatever
+  precip_labels <- function(x) {round((-1*x/watershedArea_sqft)*12*24*60*60*25, 2)} # labels in inches/day
+  
+  # melt for ggplot dataframe
+  results_sub_melted <- melt(resultsdf_sub[, c("DATE", "discharge_cfs", "LMLOGOFIT_cfs", "GLMLOGOFIT_cfs", "RFLOGOFIT_cfs", "NNLOGOFIT_cfs")], id.var='DATE')
+  
+  # make the plot
+  hydrograph <- ggplot(data = results_sub_melted, 
+                       aes(x = DATE, y=value, col=variable)) + 
+    xlab("")  + 
+    ggtitle(paste0('Basin CDEC ID: ', h)) +
+    
+    # use geom_tile to create the inverted hyetograph. geom_tile has a bug that displays a warning message for height and width, you can ignore it.
+    geom_tile(data=resultsdf_sub, aes(y = -1*(precip_cfs/2-maxRange), # y = the center point of each bar
+              height = precip_cfs,
+              width = 2),
+              fill = cbpblack[6],
+              color = cbpblack[6]) +
+  
+    # plot your discharge data
+    geom_line() +
+    scale_colour_manual("", values = c(cbpblack[1:5]), labels=c("Obs", "LM", "GLM", "RF", "NN")) +
+    theme(legend.position="bottom", legend.title = element_blank()) +
+  
+    # create a second axis with sec_axis() and format the labels to display the original precipitation units
+    scale_y_continuous(name = "Discharge (cfs)", sec.axis = sec_axis(trans = ~1*(.-maxRange), name = "Precipitation (in/d)", labels = precip_labels))
+  
+  png(paste0('Output Data/ts/timeseries_', h, '.png'), width=6.5, height=8, units="in", pointsize=12, res=300)
+  par(mar=c(5,4,1,1)+0.1, ps=8, cex=1)
+  print(hydrograph)
+  dev.off()
+}
+```
+
+```{r tsplots_comp2}
+# zoom in
+for (r in 1:(length(unique(results$CDEC_ID)))){ 
+  # plot time series by basin
+  h <- unique(results$CDEC_ID)[r]
+  resultsdf_sub <- results[results$CDEC_ID==h,]
+  resultsdf_sub <- resultsdf_sub[resultsdf_sub$DATE<="2001-10-01", ]
+  
+  # convert the units. AREASQM is in square miles, PPT is in mm/day, FLOW is in cfs 
+  watershedArea_sqft <- resultsdf_sub$AREASQM[1]*(5280)^2
+  resultsdf_sub$precip_ft <- resultsdf_sub$PPT/10/2.54/12
+  resultsdf_sub$precip_cuft <- resultsdf_sub$precip_ft * watershedArea_sqft
+  resultsdf_sub$precip_cfs <- resultsdf_sub$precip_cuft/24/60/60/25 # arbitrary 25 to get the scale right
+  resultsdf_sub$discharge_cfs <- resultsdf_sub$FLOW # no conversion needed
+  
+  resultsdf_sub$LMLOGOFIT_cfs <- resultsdf_sub$LM_LOGOFIT
+  resultsdf_sub$GLMLOGOFIT_cfs <- resultsdf_sub$GLM_LOGOFIT
+  resultsdf_sub$RFLOGOFIT_cfs <- resultsdf_sub$RF_LOGOFIT
+  resultsdf_sub$NNLOGOFIT_cfs <- resultsdf_sub$NN_LOGOFIT
+  
+  # remove NAs here?
+  resultsdf_sub <- na.omit(resultsdf_sub)
+  
+  # calculate the range needed to avoid having your hyetograph and hydrograph overlap 
+  maxFlow <- max(max(resultsdf_sub$discharge_cfs), 
+                 max(resultsdf_sub$LMLOGOFIT_cfs, na.rm=TRUE), 
+                 max(resultsdf_sub$GLMLOGOFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$RFLOGOFIT_cfs, na.rm=TRUE),
+                 max(resultsdf_sub$NNLOGOFIT_cfs, na.rm=TRUE)) 
+  maxRange <- 1.1*(max(resultsdf_sub$precip_cfs) + maxFlow)
+
+  # create a function to backtransform the axis labels for precipitation, for some reason multiplying it by -1 fixed the labels, kinda hacky but whatever
+  precip_labels <- function(x) {round((-1*x/watershedArea_sqft)*12*24*60*60*25, 2)} # labels in inches/day
+  
+  # melt for ggplot dataframe
+  results_sub_melted <- melt(resultsdf_sub[, c("DATE", "discharge_cfs", "LMLOGOFIT_cfs", "GLMLOGOFIT_cfs", "RFLOGOFIT_cfs", "NNLOGOFIT_cfs")], id.var='DATE')
+  
+  # make the plot
+  hydrograph <- ggplot(data = results_sub_melted, 
+                       aes(x = DATE, y=value, col=variable)) + 
+    xlab("")  + 
+    ggtitle(paste0('Basin CDEC ID: ', h)) +
+    
+    # use geom_tile to create the inverted hyetograph. geom_tile has a bug that displays a warning message for height and width, you can ignore it.
+    geom_tile(data=resultsdf_sub, aes(y = -1*(precip_cfs/2-maxRange), # y = the center point of each bar
+              height = precip_cfs,
+              width = 2),
+              fill = cbpblack[6],
+              color = cbpblack[6]) +
+  
+    # plot your discharge data
+    geom_line() +
+    scale_colour_manual("", values = c(cbpblack[1:5]), labels=c("Obs", "LM", "GLM", "RF", "NN")) +
+    theme(legend.position="bottom", legend.title = element_blank()) +
+  
+    # create a second axis with sec_axis() and format the labels to display the original precipitation units
+    scale_y_continuous(name = "Discharge (cfs)", sec.axis = sec_axis(trans = ~1*(.-maxRange), name = "Precipitation (in/d)", labels = precip_labels))
+  
+  png(paste0('Output Data/ts_zoomed/timeseries_', h, '.png'), width=6.5, height=8, units="in", pointsize=12, res=300)
+  par(mar=c(5,4,1,1)+0.1, ps=8, cex=1)
+  print(hydrograph)
+  dev.off()
+}
+```
+

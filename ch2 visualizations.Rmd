@@ -1,0 +1,301 @@
+---
+title: "visualizations"
+author: "Ellie White"
+date: "June 24, 2019"
+output: html_document
+---
+
+A record for creating data visualizations before modeling.
+
+# 1.0 Data Gathering 
+```{r dataset} 
+moddf <- readRDS('Intermediary Data/moddf.rds')
+```
+
+```{r flow_data} 
+# wide format data
+cdec_fnf_wide <- read.csv('Intermediary Data/cdec_fnf_wide.csv')
+cdec_fnf_wide$DATE <- as.Date(cdec_fnf_wide$DATE, format="%Y-%m-%d")
+cdec_fnf_wide <- cdec_fnf_wide[order(cdec_fnf_wide$DATE),]
+```
+
+```{r spatial_data}
+library(sp)
+library(dismo)
+library(raster)
+
+# CDEC Basin location
+df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
+
+df <- df[df$IN_SAC_DELTA==1,]
+sptdf <- df
+
+# keep df as a normal DataFrame for later use, and make spdf a SpatialPolygonsDataFrame
+coordinates(sptdf) <- ~LONGITUDE + LATITUDE
+proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
+
+library(rgdal)
+basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily.shp')
+caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
+cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
+
+# projections used for California
+tealalbers <- crs("+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +datum=NAD83 +units=km +ellps=GRS80")
+albers <- crs("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0")
+
+# transform to all to Albers
+sptdf <- spTransform(sptdf, albers)
+basins <- spTransform(basins, albers)
+caboundary <- spTransform(caboundary, albers)
+cacounties <- spTransform(cacounties, albers)
+
+# join the information on the stations to the SpatialPolygonsDataFrame
+basins@data <- merge(basins@data, sptdf, by="CDEC_ID")
+
+# basins_agg <- basins[1:(which(basins$CDEC_ID=="AMA_INC")[1]-1), ]
+# basins_inc <- basins[which(basins$CDEC_ID=="AMA_INC")[1]:nrow(basins), ]
+
+# print a summary table for appendix A
+library(xtable)
+tbl_appa <- basins@data[, c("CDEC_ID", "STATION", "RIVER_BASIN", "COUNTY", "ELEV_FT", "OPERATOR", "LONGITUDE", "LATITUDE")]
+rownames(tbl_appa) <- 1:dim(tbl_appa)[1]
+xtable(tbl_appa)
+```
+
+# 2.0 Plots
+
+## 2.1 Plot Elements
+```{r labels}
+library(Hmisc) 
+var_labels <- c("Date","Basin ID", "Basin Name", "River Basin", "County", "Operator", "Lon", "Lat", "Month", "Ordinal Month", "Season", "Year", "Water Year", "Temperature", "Tmp Lag 1d", "Tmp Lag 2d", "Tmp Lag 3d", "Precipitation", "Ppt Lag 1d", "Ppt Lag 2d", "Ppt Lag 3d", "Snow", "Drainage Area", "Shape", "Compactness", "Mean Elevation", "Relief Ratio", "Sat. Hyd. Conductivity", "% Silt", "% Sand", "% Clay", "Avail. Water Cont.", "Lambda Pore Size", "N Pore Size", "Depth to Restricted Layer", "Percent Vegetated", "Unimpaired Flow" ) 
+
+names(var_labels) <- names(moddf)
+Hmisc::label(moddf) <- lapply(names(var_labels), function(x) Hmisc::label(moddf[,x]) = var_labels[x])
+
+# for basin spatial data frame
+var_labels <- c("Basin ID", "Id", "In Sac Delta", "Sensor No.", "Basin Name", "River Basin", "County", "Station Elevation", "Operator", "Lon", "Lat") 
+
+names(var_labels) <- names(basins@data)
+Hmisc::label(basins@data) <- lapply(names(var_labels), function(x) Hmisc::label(basins@data[,x]) = var_labels[x])
+
+# summary stats
+summary(moddf$FLOW)
+round(apply(moddf[,14:(ncol(moddf))],2,summary),2)
+```
+
+```{r visuals}
+# colourblind palettes
+# ordered:     black      pink        orange     yellow     green       blue      darkorange  lightblue
+cbpgrey <-  c("#999999", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+
+cols <- character(nrow(moddf))
+cols[] <- "black"
+cols[moddf$FLOW >= mean(moddf$FLOW)] <- cbpblack[8]
+cols[moddf$FLOW < mean(moddf$FLOW)] <- cbpblack[3]
+
+plot(moddf$FLOW, main="Observed Response Data", ylab="Unimpaired Flow (cfs)", col=cols)
+
+# library(tabplot)
+# tableplot(moddf[,c(1:14, ncol(moddf))], sortCol="CDEC_ID")
+# tableplot(moddf[,c(1:2, 15:ncol(moddf))], sortCol="CDEC_ID") 
+```
+
+## 2.2 1D Plots
+```{r pdf_cdf_plots} 
+# use the ecdf() function to obtain the empirical CDF values
+png('Output Data/rplot21_flowcdf.png', width=3.25, height=3, units="in", pointsize=8, res=300)
+  par(mar=c(4,4.5,1,1)+0.1)
+  plot(ecdf(moddf$FLOW),log='x',xlim=c(0.1,1e+7), xlab='', ylab = '', main="", do.points=TRUE, panel.first=c(abline(v=c(seq(1e-1, 1e+1, 1), seq(1e+1, 1e+3, 1e+2), seq(1e+3, 1e+5, 1e+4), seq(1e+5, 1e+7, 1e+6)), lty=3, col="grey"), abline(h=seq(0,1,0.2), lty=3, col="grey")))
+  # add label for y-axis
+  # the "line" option is used to set the position of the label
+  mtext(text = expression(hat(F)[n](x)), side = 2, line = 3)
+  mtext(text='Percentiles for Unimpaired Flow', side=2, line=2)
+  mtext(text='Sorted Unimpaired Flow (cfs)', side=1, line=2)
+dev.off()
+
+# # or use this method for plotting the Empirical Cumluative Distribution
+# flow_ordered <- sort(moddf$FLOW)
+# n <- sum(!is.na(moddf$FLOW))
+# # notice the option type = 's' for plotting the step functions
+# plot(flow_ordered, (1:n)/n, type = 's', ylim = c(0, 1), xlab = 'Sorted Monthly Unimpaired Flow', ylab = '', main = '', xlim=c(0.1,max(moddf$FLOW)), log='x')
+# mtext(text = expression(hat(F)[n](x)), side = 2, line = 2.5)
+
+png('Output Data/rplot21_flowcdf2.png', width=3.25, height=3, units="in", pointsize=8, res=300)
+par(mar=c(4,4.5,1,1)+0.1)
+  plot(ecdf(moddf$FLOW),xlim=c(0.1,1.5e+5), xlab='', ylab = '', main="", do.points=TRUE, panel.first=c(abline(v=seq(0, 1.5e+5, 1e4), lty=3, col="grey"), abline(h=seq(0,1,0.2), lty=3, col="grey")))
+  # add label for y-axis
+  # the "line" option is used to set the position of the label
+  mtext(text = expression(hat(F)[n](x)), side = 2, line = 3)
+  mtext(text='Percentiles for Unimpaired Flow', side=2, line=2)
+  mtext(text='Sorted Unimpaired Flow (cfs)', side=1, line=2)
+dev.off()
+```
+
+```{r hist_plots} 
+# histogram with kernel density estimate
+png('Output Data/rplot22_histkdp.png', width=3.25, height=3, units="in", pointsize=8, res=300)
+  par(mar=c(4,4,1,1)+0.1)
+  hist(moddf$FLOW, breaks=20, freq=FALSE, xlab='Unimpaired Flow (cfs)', ylab='Relative Frequency', main='', xlim=c(0,max(moddf$FLOW, na.rm=TRUE)), ylim=c(0,0.0002), cex.axis=0.8)
+  lines(density(moddf$FLOW, na.rm=TRUE), lty=3, lwd=1, col=cbpblack[7])
+  legend("topright", inset=0.05, cex=0.8, c("histogram", "kernal density"), horiz=FALSE, lty=c(1,3), bg="grey96", col=c("black", cbpblack[7]), box.lty=0)
+dev.off()
+
+# Notice how the histogram rises quickly for low values of flow, then decreases gradually.  The gamma distribution has this behavior.  However, in order to define the gamma function, we need a way to estimate the parameters.
+# histogram with gamma density curve
+png('Output Data/rplot22_histgdc.png', width=3.25, height=3, units="in", pointsize=8, res=300)
+  par(mar=c(4,4,1,1)+0.1)
+  hist(moddf$FLOW, breaks=20, freq=FALSE, xlab='Unimpaired Flow (cfs)', ylab='Relative Frequency', main='', xlim=c(0,max(moddf$FLOW, na.rm=TRUE)), ylim=c(0,0.0002), cex.axis=0.8)
+  curve(dgamma(x, shape = mean(moddf$FLOW)^2/var(moddf$FLOW), scale = var(moddf$FLOW)/mean(moddf$FLOW)), add=TRUE, col=cbpblack[7], lwd=1, lty=3)
+  legend("topright", inset=0.05, cex=0.8, c("histogram", "gamma density curve"), horiz=FALSE, lty=c(1,3), bg="grey96", col=c("black", cbpblack[7]), box.lty=0)
+dev.off()
+```
+
+## 2.3 2D Plots
+```{r box_plots}
+library(ggplot2)
+# order months in moddf for boxplots
+moddf_c <- moddf
+moddf_c$MONTH <- factor(moddf$MONTH, levels=c("Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"))
+
+# Box plot with jittered points
+png('Output Data/rplot23_boxplot.png', width=6.5, height=3, units="in", pointsize=8, res=300)
+ggplot(moddf_c, aes(x=MONTH, y=FLOW, col=CDEC_ID)) + 
+  geom_jitter(shape=16, position=position_jitter(0.2), alpha=0.2) +
+  geom_boxplot(outlier.shape=NA) +
+  labs(x="", y="Unimpaired Flow (cfs)", col="Basin") +
+  scale_color_manual(values=c(cbpblack, cbpgrey[1])) +
+  theme_bw(base_size = 8) +
+  theme(legend.position="right")
+dev.off()
+
+png('Output Data/rplot24_flowvslat.png', width=6.5, height=3, units="in", pointsize=8, res=300)
+ggplot(moddf_c, aes(x=LATITUDE, y=FLOW, col=CDEC_ID)) + 
+  geom_jitter(shape=16, position=position_jitter(0.1), alpha=0.2) +
+  labs(x="Latitude (deg)", y="Unimpaired Flow (cfs)", col="Basin") +
+  scale_color_manual(values=c(cbpblack, cbpgrey[1])) +
+  theme_bw(base_size = 8) +
+  theme(legend.position="right") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))
+dev.off()
+```
+
+```{r correlation_plots}
+png('Output Data/rplot25_tmpvsppt.png', width=6.5, height=4, units="in", pointsize=8, res=300)
+par(mar=c(4,4,1,1)+0.1)
+ggplot(moddf, aes(x=PPT, y=TMP, size=FLOW, fill=CDEC_ID)) +
+  geom_point(alpha=0.5, shape=21) +
+  labs(x="Precipitation (mm)", 
+       y=substitute(paste('Temperature', B * degree, "C)"),  list(B = " (")),
+       size= "Flow (cfs)", 
+       fill = "Basin") +
+  scale_size_area(max_size = 8) +
+  theme_bw() +
+  scale_fill_manual(values = c(cbpblack, cbpgrey[1])) +
+  guides(fill = guide_legend(override.aes = list(alpha = 1)))
+dev.off()
+
+png('Output Data/rplot26_pptvsflow.png', width=6.5, height=4, units="in", pointsize=10, res=300)
+par(mar=c(4,4,1,1)+0.1)
+ggplot(moddf, aes(x=PPT, y=FLOW, size=AREASQM, fill=CDEC_ID)) +
+  geom_point(alpha=0.2, shape=21) +
+  labs(x="Precipitation (mm)", y="Unimpaired Flow (cfs)", size= "Drainage Area (sqm)", fill = "Basin") +
+  scale_size_area(max_size = 8) +
+  theme_bw() +
+  scale_fill_manual(values = c(cbpblack, cbpgrey[1])) +
+  guides(fill = guide_legend(override.aes = list(alpha = 1)))
+dev.off()
+
+png('Output Data/rplot27_pptvsarea.png', width=6.5, height=4, units="in", pointsize=10, res=300)
+par(mar=c(4,4,1,1)+0.1)
+ggplot(moddf, aes(x=PPT, y=AREASQM, size=FLOW, fill=CDEC_ID)) +
+  geom_point(alpha=0.2, shape=21) +
+  labs(x="Precipitation (mm)", y="Drainage Area (sqm)", size= "Flow (cfs)", fill = "Basin") +
+  scale_size_area(max_size = 8) +
+  scale_fill_manual(values =  c(cbpblack, cbpgrey[1])) +
+  guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+  theme_bw() 
+dev.off()
+```
+
+## 2.5 Scatter Plots
+```{r scatterplot_matrix}
+library(hexbin)
+png('Output Data/rplot28_scatterplotmatrix1.png', width=6.5, height=6.5, units="in", pointsize=10, res=300)
+# some changes to diag.panel in order to show the univariate density of each variable
+splom(moddf[ ,14:ncol(moddf)],
+ panel=panel.hexbinplot,
+ diag.panel = function(x, ...){
+ yrng <- current.panel.limits()$ylim
+ d <- density(x, na.rm=TRUE)
+ d$y <- with(d, yrng[1] + 0.95 * diff(yrng) * y / max(y) )
+ panel.lines(d)
+ diag.panel.splom(x, ...)
+ col= 'darkblue'
+ },
+ lower.panel = function(x, y, ...){
+ panel.hexbinplot(x, y, ...)
+ panel.loess(x, y, ..., col = 'red')
+ },
+ pscale=0, varname.cex=0.3,
+ xlab='',
+ main='', 
+ varnames=Hmisc::label(moddf)[14:ncol(moddf)]
+ )
+dev.off()
+```
+
+```{r corrplot}
+# draw a correlolgram
+library(corrplot)
+png('Output Data/rplot29_corrplot.png', width=6.5, height=5.69, units="in", pointsize=8, res=300)
+  par(mar=c(4,1,0,0)+0.1)
+  cols <- colorRampPalette(c(cbpblack[3],'grey80',cbpblack[8]))
+  moddf_c <- moddf
+  colnames(moddf_c) <- Hmisc::label(moddf)
+  corrplot(cor(moddf_c[,-c(1:16)]), order="hclust", tl.col="black", method="color", addCoef.col="white",  addCoefasPercent=TRUE, col=cols(100), tl.pos="lt", diag=FALSE, cl.pos="r", tl.cex=1, number.cex=0.7, tl.srt = 90)
+dev.off()
+```
+
+```{r cor_dotchart}
+library(Hmisc)
+png('Output Data/rplot210_corrwithflow.png', width=3.25, height=3, units="in", pointsize=8, res=300)
+  par(mar=c(4,11,1,1)+0.1)
+  corrdf <- cor(moddf[,-c(1:12)])
+  corrdf <- corrdf[ncol(corrdf), 1:ncol(corrdf)]
+  corrdf <- merge(data.frame(corrdf), data.frame(Hmisc::label(moddf)), by=0)
+  corrdf <- corrdf[order(corrdf$corrdf,decreasing=FALSE),]
+  dotchart(corrdf[,2], xlim=c(-0.5,1.1), xlab="Correlation With \n Unimpaired Flow", pch=19, pt.cex = 0.7, panel.first=abline(v=0, col=cbpblack[8], lty=2))
+  axis(side = 2, seq_along(corrdf[,2]), corrdf[,3], las=1, tick=FALSE, cex.axis=0.7) 
+  text(x=corrdf[1:nrow(corrdf),2], y=1:nrow(corrdf), labels=round(corrdf[1:nrow(corrdf),2],2), pos=4, cex=0.7)
+dev.off()
+
+# In R, there are several packages for getting the partial correlation coefficients along with the t- test for checking their significance level. Use the package to compute the partial correlation coefficients along with the t-statistic and corresponding p-values.corpcor had a better way of calculating the partial correlations without so many errors in the covariance matrix not being positive definite and being singular.
+
+library(corpcor) # cor2pcor computes the pairwise partial correlation coefficients from either a correlation or a covariance matrix
+png('Output Data/rplot210_partialcorrwithflow.png', width=3.5, height=3, units="in", pointsize=8, res=300)
+  par(mar=c(4,11,1,1)+0.1)
+  corrdf <- cor(moddf_c[,-c(1:12)])
+  pcorrdf <- cor2pcor(corrdf)
+  pcorrdf <- pcorrdf[ncol(pcorrdf), 1:ncol(pcorrdf)]
+  pcorrdf <- cbind(data.frame(pcorrdf), data.frame(Hmisc::label(moddf_c)[-c(1:12)]))
+  colnames(pcorrdf)[2] <- "LABEL"
+  pcorrdf <- pcorrdf[order(pcorrdf$pcorrdf,decreasing=FALSE),]
+  dotchart(pcorrdf[,1], xlim=c(-0.5,1.1), xlab="Partial Correlation \n With Unimpaired Flow", pch=19, pt.cex=0.7)
+  axis(side = 2, seq_along(pcorrdf[,1]), pcorrdf[,2], las=1, tick=FALSE, cex.axis=0.7) 
+  text(x=pcorrdf[1:nrow(pcorrdf),1], y=1:nrow(pcorrdf), labels=round(pcorrdf[1:nrow(pcorrdf),1],2), pos=4, cex=0.7)
+  abline(v=0, col=cbpblack[8], lty=2)
+dev.off()
+```
+
+## 2.6 Spatial Plots
+```{r spatial_plots}
+png('Output Data/rplot211_map.png', width=3.25, height=5, units="in", pointsize=10, res=300)
+  par(mar=c(0,3,2,1)+0.1)
+  plot(cacounties, col='white', border='white')
+  plot(cacounties, col='gray88', border='white', add=TRUE)
+  plot(basins, col='lightslategrey', border='white', add=TRUE)
+  plot(sptdf, col='darkblue', add=TRUE, pch=20)
+  text(sptdf, labels=as.character(sptdf@data$CDEC_ID), col="darkblue", cex=0.5, offset=0.25, pos=4)
+dev.off()
+```
