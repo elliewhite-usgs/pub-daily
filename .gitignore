@@ -1,0 +1,15 @@
+# ignore r generated files
+*.log
+*.Rproj
+.Rproj.user
+.RData
+.Rhistory
+.RDataTmp
+.RDataTmp1
+
+
+# files I don't want on github
+/Input Data
+/Intermediary Data
+/Output Data/rds
+intro to ml.mp4 
