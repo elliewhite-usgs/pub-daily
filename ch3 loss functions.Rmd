@@ -100,7 +100,7 @@ cdec_fnf_wide <- cdec_fnf_wide[cdec_fnf_wide$DATE>="2010-01-01", ]
 # colourblind palettes
 # ordered:     black      pink        orange     yellow     green       blue      darkorange  lightblue
 cbpgrey <-  c("#999999", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
-cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9", "#DDCC77", "#CC6677", "#117733", "#332288", "#AA4499", "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
 ```
 
 # 2.0 Data Tranformations
@@ -929,8 +929,8 @@ png('Output Data/rplot33_obsvspred_all_nn.png', width=6.5, height=8, units="in",
                 parse = TRUE) +
     geom_abline(slope=1, intercept=0, color="black", linetype=3)+
     facet_wrap(~LOSS_FUNCTION, ncol=2, labeller=labeller(LOSS_FUNCTION=pretty_facet_labels))+
-    scale_discrete_manual(aesthetics = "color", values=c(cbpblack, cbpgrey[1]), name="Basin")+
-    scale_discrete_manual(aesthetics= "shape", values=c(1:9), name="Basin") +
+    scale_discrete_manual(aesthetics = "color", values=cbpblack, name="Basin")+
+    scale_discrete_manual(aesthetics= "shape", values=c(1:19), name="Basin") +
     labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
     theme(legend.text=element_text(size=10), text=element_text(size=10))+
     theme_bw(base_size = 8)
@@ -1189,7 +1189,7 @@ gofdotchart <- function(gof_results_mse, gof_results_logcosh, gof_results_mae, g
       theme(legend.position="bottom", legend.title = element_blank())+
       guides(color = guide_legend(nrow = 1), shape= guide_legend(nrow = 1))
   
-  png(paste0('Output Data/rplot310_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+  png(paste0('Output Data/rplot36_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
     print(plottoprint)
   dev.off()
 }

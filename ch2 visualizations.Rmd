@@ -26,8 +26,6 @@ library(raster)
 
 # CDEC Basin location
 df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
-
-df <- df[df$IN_SAC_DELTA==1,]
 sptdf <- df
 
 # keep df as a normal DataFrame for later use, and make spdf a SpatialPolygonsDataFrame
@@ -35,7 +33,7 @@ coordinates(sptdf) <- ~LONGITUDE + LATITUDE
 proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
 
 library(rgdal)
-basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily.shp')
+basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily2.shp')
 caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
 cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
 
@@ -87,7 +85,7 @@ round(apply(moddf[,14:(ncol(moddf))],2,summary),2)
 # colourblind palettes
 # ordered:     black      pink        orange     yellow     green       blue      darkorange  lightblue
 cbpgrey <-  c("#999999", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
-cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9", "#DDCC77", "#CC6677", "#117733", "#332288", "#AA4499", "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
 
 cols <- character(nrow(moddf))
 cols[] <- "black"
@@ -159,21 +157,21 @@ moddf_c <- moddf
 moddf_c$MONTH <- factor(moddf$MONTH, levels=c("Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"))
 
 # Box plot with jittered points
-png('Output Data/rplot23_boxplot.png', width=6.5, height=3, units="in", pointsize=8, res=300)
+png('Output Data/rplot23_boxplot.png', width=6.5, height=4, units="in", pointsize=8, res=300)
 ggplot(moddf_c, aes(x=MONTH, y=FLOW, col=CDEC_ID)) + 
   geom_jitter(shape=16, position=position_jitter(0.2), alpha=0.2) +
   geom_boxplot(outlier.shape=NA) +
   labs(x="", y="Unimpaired Flow (cfs)", col="Basin") +
-  scale_color_manual(values=c(cbpblack, cbpgrey[1])) +
+  scale_color_manual(values=cbpblack) +
   theme_bw(base_size = 8) +
   theme(legend.position="right")
 dev.off()
 
-png('Output Data/rplot24_flowvslat.png', width=6.5, height=3, units="in", pointsize=8, res=300)
+png('Output Data/rplot24_flowvslat.png', width=6.5, height=4, units="in", pointsize=8, res=300)
 ggplot(moddf_c, aes(x=LATITUDE, y=FLOW, col=CDEC_ID)) + 
   geom_jitter(shape=16, position=position_jitter(0.1), alpha=0.2) +
   labs(x="Latitude (deg)", y="Unimpaired Flow (cfs)", col="Basin") +
-  scale_color_manual(values=c(cbpblack, cbpgrey[1])) +
+  scale_color_manual(values=cbpblack) +
   theme_bw(base_size = 8) +
   theme(legend.position="right") +
   guides(colour = guide_legend(override.aes = list(alpha = 1)))
@@ -181,7 +179,7 @@ dev.off()
 ```
 
 ```{r correlation_plots}
-png('Output Data/rplot25_tmpvsppt.png', width=6.5, height=4, units="in", pointsize=8, res=300)
+png('Output Data/rplot25_tmpvsppt.png', width=6.5, height=6, units="in", pointsize=8, res=300)
 par(mar=c(4,4,1,1)+0.1)
 ggplot(moddf, aes(x=PPT, y=TMP, size=FLOW, fill=CDEC_ID)) +
   geom_point(alpha=0.5, shape=21) +
@@ -191,28 +189,28 @@ ggplot(moddf, aes(x=PPT, y=TMP, size=FLOW, fill=CDEC_ID)) +
        fill = "Basin") +
   scale_size_area(max_size = 8) +
   theme_bw() +
-  scale_fill_manual(values = c(cbpblack, cbpgrey[1])) +
+  scale_fill_manual(values = cbpblack) +
   guides(fill = guide_legend(override.aes = list(alpha = 1)))
 dev.off()
 
-png('Output Data/rplot26_pptvsflow.png', width=6.5, height=4, units="in", pointsize=10, res=300)
+png('Output Data/rplot26_pptvsflow.png', width=6.5, height=6, units="in", pointsize=10, res=300)
 par(mar=c(4,4,1,1)+0.1)
 ggplot(moddf, aes(x=PPT, y=FLOW, size=AREASQM, fill=CDEC_ID)) +
   geom_point(alpha=0.2, shape=21) +
   labs(x="Precipitation (mm)", y="Unimpaired Flow (cfs)", size= "Drainage Area (sqm)", fill = "Basin") +
   scale_size_area(max_size = 8) +
   theme_bw() +
-  scale_fill_manual(values = c(cbpblack, cbpgrey[1])) +
+  scale_fill_manual(values = cbpblack) +
   guides(fill = guide_legend(override.aes = list(alpha = 1)))
 dev.off()
 
-png('Output Data/rplot27_pptvsarea.png', width=6.5, height=4, units="in", pointsize=10, res=300)
+png('Output Data/rplot27_pptvsarea.png', width=6.5, height=6, units="in", pointsize=10, res=300)
 par(mar=c(4,4,1,1)+0.1)
 ggplot(moddf, aes(x=PPT, y=AREASQM, size=FLOW, fill=CDEC_ID)) +
   geom_point(alpha=0.2, shape=21) +
   labs(x="Precipitation (mm)", y="Drainage Area (sqm)", size= "Flow (cfs)", fill = "Basin") +
   scale_size_area(max_size = 8) +
-  scale_fill_manual(values =  c(cbpblack, cbpgrey[1])) +
+  scale_fill_manual(values =  cbpblack) +
   guides(fill = guide_legend(override.aes = list(alpha = 1))) +
   theme_bw() 
 dev.off()

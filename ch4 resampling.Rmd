@@ -62,8 +62,6 @@ moddf <- readRDS('Intermediary Data/moddf.rds')
 # some helpful dataframes, may come in handy later for post processing
 sptdf <- df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
 
-sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,]
-
 coordinates(sptdf) <- ~LONGITUDE + LATITUDE
 proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
 
@@ -100,7 +98,7 @@ cdec_fnf_wide <- cdec_fnf_wide[cdec_fnf_wide$DATE>="2010-01-01", ]
 # colourblind palettes
 # ordered:     black      pink        orange     yellow     green       blue      darkorange  lightblue
 cbpgrey <-  c("#999999", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
-cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+cbpblack <- c("#000000", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9", "#DDCC77", "#CC6677", "#117733", "#332288", "#AA4499", "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
 ```
 
 # 2.0 Data Tranformations
@@ -423,17 +421,16 @@ rfcv <- function(data, groupingstyle, datatype){
 }
 
 # rf_resub_results <- rfcv(moddf, "resub")
-# rf_2fold_results <- rfcv(moddf, 2L)
-# rf_5fold_results <- rfcv(moddf, 5L)
-# rf_10fold_results <- rfcv(moddf, 10L)
-# rf_logo_results <- rfcv(moddf, "logo")
-# rf_lmgo_results <- rfcv(moddf, "lmgo")
-# 
 # saveRDS(rf_resub_results, file="Output Data/rds/rf_resub_results.RDS")
+# rf_2fold_results <- rfcv(moddf, 2L)
 # saveRDS(rf_2fold_results, file="Output Data/rds/rf_2fold_results.RDS")
+# rf_5fold_results <- rfcv(moddf, 5L)
 # saveRDS(rf_5fold_results, file="Output Data/rds/rf_5fold_results.RDS")
+# rf_10fold_results <- rfcv(moddf, 10L)
 # saveRDS(rf_10fold_results, file="Output Data/rds/rf_10fold_results.RDS")
+# rf_logo_results <- rfcv(moddf, "logo")
 # saveRDS(rf_logo_results, file="Output Data/rds/rf_logo_results.RDS")
+# rf_lmgo_results <- rfcv(moddf, "lmgo")
 # saveRDS(rf_lmgo_results, file="Output Data/rds/rf_lmgo_results.RDS")
 
 rf_resub_results <- readRDS("Output Data/rds/rf_resub_results.RDS")
@@ -603,17 +600,16 @@ nncv <- function(data, groupingstyle, datatype){
 }
 
 # nn_resub_results <- nncv(moddf, "resub")
-# nn_2fold_results <- nncv(moddf, 2L)
-# nn_5fold_results <- nncv(moddf, 5L)
-# nn_10fold_results <- nncv(moddf, 10L)
-# nn_logo_results <- nncv(moddf, "logo")
-# nn_lmgo_results <- nncv(moddf, "lmgo")
-# 
 # saveRDS(nn_resub_results, file="Output Data/rds/nn_resub_results.RDS")
+# nn_2fold_results <- nncv(moddf, 2L)
 # saveRDS(nn_2fold_results, file="Output Data/rds/nn_2fold_results.RDS")
+# nn_5fold_results <- nncv(moddf, 5L)
 # saveRDS(nn_5fold_results, file="Output Data/rds/nn_5fold_results.RDS")
+# nn_10fold_results <- nncv(moddf, 10L)
 # saveRDS(nn_10fold_results, file="Output Data/rds/nn_10fold_results.RDS")
+# nn_logo_results <- nncv(moddf, "logo")
 # saveRDS(nn_logo_results, file="Output Data/rds/nn_logo_results.RDS")
+# nn_lmgo_results <- nncv(moddf, "lmgo")
 # saveRDS(nn_lmgo_results, file="Output Data/rds/nn_lmgo_results.RDS")
 
 nn_resub_results <- readRDS("Output Data/rds/nn_resub_results.RDS")
@@ -1073,8 +1069,8 @@ png('Output Data/rplot43_obsvspred_all_nn.png', width=6.5, height=8, units="in",
                 parse = TRUE) +
     geom_abline(slope=1, intercept=0, color="black", linetype=3)+
     facet_wrap(~GROUPINGSTYLE, ncol=2, labeller=labeller(GROUPINGSTYLE=pretty_facet_labels))+
-    scale_discrete_manual(aesthetics = "color", values=c(cbpblack, cbpgrey[1]), name="Basin")+
-    scale_discrete_manual(aesthetics= "shape", values=c(1:9), name="Basin") +
+    scale_discrete_manual(aesthetics = "color", values=cbpblack, name="Basin")+
+    scale_discrete_manual(aesthetics= "shape", values=c(1:19), name="Basin") +
     labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
     theme(legend.text=element_text(size=10), text=element_text(size=10))+
     theme_bw(base_size = 8)
@@ -1159,12 +1155,12 @@ br2map <- function(gof_results, modelform, groupingstyle, datatype){
   dev.off()
 }
 
-br2map(gof_nn_resub_by_basins, "nn", "resub", "agg")
-br2map(gof_nn_2fold_by_basins, "nn", "2fold", "agg")
-br2map(gof_nn_5fold_by_basins, "nn", "5fold", "agg")
-br2map(gof_nn_10fold_by_basins, "nn", "10fold", "agg")
+# br2map(gof_nn_resub_by_basins, "nn", "resub", "agg")
+# br2map(gof_nn_2fold_by_basins, "nn", "2fold", "agg")
+# br2map(gof_nn_5fold_by_basins, "nn", "5fold", "agg")
+# br2map(gof_nn_10fold_by_basins, "nn", "10fold", "agg")
 br2map(gof_nn_logo_by_basins, "nn", "logo", "agg")
-br2map(gof_nn_lmgo_by_basins, "nn", "lmgo", "agg")
+# br2map(gof_nn_lmgo_by_basins, "nn", "lmgo", "agg")
 ```
 
 ## 6.5 Dotcharts
@@ -1283,21 +1279,21 @@ gofdotchart <- function(gof_results_resub, gof_results_2fold, gof_results_5fold,
   
   # order the basins based on LOGO values, decreasing
   orderrownums <- as.numeric(row.names(basinsc5r[order(basinsc5r$VALUE, decreasing=TRUE), ]))
-  basinscr <- basinscr[orderrownums, ]
-  basinsc2r <- basinsc2r[orderrownums, ]
-  basinsc3r <- basinsc3r[orderrownums, ]
-  basinsc4r <- basinsc4r[orderrownums, ]
-  basinsc5r <- basinsc5r[orderrownums, ]
-  basinsc6r <- basinsc6r[orderrownums, ]
+  # basinscr <- basinscr[orderrownums, ]
+  # basinsc2r <- basinsc2r[orderrownums, ]
+  # basinsc3r <- basinsc3r[orderrownums, ]
+  # basinsc4r <- basinsc4r[orderrownums, ]
+  # basinsc5r <- basinsc5r[orderrownums, ]
+  # basinsc6r <- basinsc6r[orderrownums, ]
   
   # bind aacross the different grouping styles
   basinscm <- rbind(basinscr, basinsc2r, basinsc3r, basinsc4r, basinsc5r, basinsc6r)
   basinscm$GROUPINGSTYLE <- factor(basinscm$GROUPINGSTYLE, levels = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))
-  basinscm$CDEC_ID <- factor(basinscm$CDEC_ID)
+  basinscm$CDEC_ID <- factor(basinscm$CDEC_ID, levels=basinsc5r$CDEC_ID[rev(orderrownums)])
   
   png(paste0('Output Data/rplot416_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=4, units="in", pointsize=8, res=1200)
     plottoprint <- ggplot(data=basinscm, aes(x=VALUE, y=CDEC_ID)) +
-      geom_point(aes(shape=GROUPINGSTYLE, color=GROUPINGSTYLE), size=4)+
+      geom_point(aes(shape=GROUPINGSTYLE, color=GROUPINGSTYLE), size=2)+
       scale_shape_manual(breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"), values=c(4, 2, 5, 8, 16, 15)) + 
       scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[2], cbpblack[3], cbpblack[4], cbpblack[5], cbpblack[8], cbpblack[6]), breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO")) +
       labs(x=fitofinterestlabel, y="")+
