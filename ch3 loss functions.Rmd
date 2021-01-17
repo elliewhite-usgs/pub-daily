@@ -62,7 +62,7 @@ moddf <- readRDS('Intermediary Data/moddf.rds')
 # some helpful dataframes, may come in handy later for post processing
 sptdf <- df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
 
-sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,]
+# sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,] no longer ommiting other basins from the study
 
 coordinates(sptdf) <- ~LONGITUDE + LATITUDE
 proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
@@ -70,6 +70,7 @@ proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
 library(rgdal)
 library(sp)
 library(raster)
+library(rgeos)
 basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily.shp')
 caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
 cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
@@ -151,10 +152,7 @@ CANNOT have other parameters that y_true, y_pred in the loss function! So, the p
 # devtools::install_github("rstudio/tensorflow")
 
 library(keras)
-install_keras(tensorflow = "1.12")
-
-# for normalizing data
-library (caret)
+install_keras()
 
 # custom losses
 # the custom loss functions for R need to operate on tensor objects rather than R primitives. In order to perform these operations, you need to get a reference to the backend using backend(). In my system configuration, this returns a reference to tensorflow.
@@ -191,7 +189,7 @@ wlse <- function(y_true, y_pred, flood_vect, alphad, betad, alphaf, betaf){
 }
 
 wlse_wrapper_stochastic <- custom_metric("wlse", function(y_true, y_pred){
-  wlse(y_true, y_pred, flood_vect=trainsetpvs2[, "FLOOD"], alphad=0.00001, betad=0.00005, alphaf=0.00005, betaf=0.00001)
+  wlse(y_true, y_pred, flood_vect=trainset[, "FLOOD"], alphad=0.00001, betad=0.00005, alphaf=0.00005, betaf=0.00001)
 })
 
 linexe <- function(y_true, y_pred, flood_vect, phid, phif){
@@ -208,16 +206,12 @@ linexe <- function(y_true, y_pred, flood_vect, phid, phif){
 
 linexe_wrapper_stochastic <- custom_metric("linexe", function(y_true, y_pred){
   # make sure phid is positive, and phif is negative
-  linexe(y_true, y_pred, flood_vect=trainsetpvs2[, "FLOOD"], phid=1.0, phif=-1.5)
+  linexe(y_true, y_pred, flood_vect=trainset[, "FLOOD"], phid=1.0, phif=-1.5)
 })
 
 # need to write a wlse_wrapper_minibatch function if you want to speed up training. For now just use long epochs. 
 
-# example y_true and y_pred to play with
-#y_true=trainsetrv
-#y_pred=trainsetrv*1.1+10000
-#y_pred=y_true*2-rnorm(nrow(trainsetpvs2), 0, 0.01)*20000
-
+# these experiments get funky when standradizing the data. I suspect it is because we want to keep the information of the distributions in, when fitting to different parts of it. Go back to relu activations without standardizing. 
 nnloss <- function(data, losstype){
   optimmodel <- results <- modgof <- list()
   
@@ -232,132 +226,139 @@ nnloss <- function(data, losstype){
     testsetrv <- as.matrix(testset$FLOW)
     trainsetrv <- as.matrix(trainset$FLOW)
     
+    # # mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)! not doing this for these experiments becuase we want to keep the shape of the distributions
+    # trainmean <- apply(trainsetpvs, 2, mean)
+    # trainsd <- apply(trainsetpvs, 2, sd)
+    # trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+    # testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+    
     # for asymmetric losses: designate each observation as a flood:1 or a drought:0 for asymmetric losses
     floodlvl_mean <- aggregate(PPT~CDEC_ID, data=trainset, FUN=mean)
     colnames(floodlvl_mean)[2] <- "FLVL_MEAN"
     trainset <- merge(trainset, floodlvl_mean, by="CDEC_ID")
-    trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0) 
-    trainsetpvs2 <- as.matrix(trainset[,c(10, 13:36, 38)]) 
-    trainsetrv2 <- as.matrix(trainset$FLOW)
-    
-    # normalize the training set on standard deviation, then normalize testset by using mean and SD of training set so no leaks happen
-    scale_par <- preProcess(trainsetpvs, method=c("scale"))
-    trainsetpvs_scaled <- data.frame(predict(scale_par, trainsetpvs))
-    testsetpvs_scaled <- predict(scale_par, testsetpvs) # this should remain a matrix
-    # add in the flood column, since the data wasn't shuffled just columnbind
-    trainsetpvs_scaled2 <- trainsetpvs_scaled
-    trainsetpvs_scaled2$FLOOD <- trainset$FLOOD
-    trainsetpvs_scaled2 <- as.matrix(trainsetpvs_scaled2) # back to matrix form 
-    trainsetpvs_scaled <- as.matrix(trainsetpvs_scaled)
-    
-    # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
-    nnmodel <- keras_model_sequential() %>% # use: "relu", "sigmoid", "softmax"
-      layer_dense(units=64, activation="relu", input_shape=dim(trainsetpvs)[[2]]) %>%
+    trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0) # this gets passed into the wrappers
+
+    # define the model
+    nfeat <- dim(data[,c(10,13:(ncol(data)-1))])[2]
+    nnmodel <- keras_model_sequential() %>%
+      layer_dense(units=64, activation="relu", input_shape=nfeat) %>%
       layer_dense(units=64, activation="relu") %>%
-      layer_dense(units=1) # number of outputs, here we just want one prediction
+      layer_dense(units=1)
+    
+    # # define callbacks
+    # callbacks <- list(callback_early_stopping(patience=10, mode="min", restore_best_weights=TRUE))
     
     # first, losses provided by keras
     if(losstype=="mse"){
-      nnmodel %>% # to compile the model, loss functions are defined here
-        compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
-      nnmodel %>%  # this is to fit the model coefficients
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+      nnmodel %>% 
+        compile(optimizer="rmsprop", loss=loss_mean_squared_error, metrics=c("mae"))
+      nnmodel %>%  
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
-      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("mse, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     if(losstype=="mae"){
       nnmodel %>% 
-        compile(optimizer="rmsprop", loss=keras::loss_mean_absolute_error, metrics=c("mae"))
+        compile(optimizer="rmsprop", loss=loss_mean_absolute_error, metrics=c("mae"))
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("mae, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     if(losstype=="msle"){ 
       nnmodel %>% 
-        compile(optimizer="rmsprop", loss=keras::loss_mean_squared_logarithmic_error, metrics=c("mae"))
+        compile(optimizer="rmsprop", loss=loss_mean_squared_logarithmic_error, metrics=c("mae"))
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("msle, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     if(losstype=="mape"){ 
       nnmodel %>% 
-        compile(optimizer="rmsprop", loss=keras::loss_mean_absolute_percentage_error, metrics=c("mae"))
+        compile(optimizer="rmsprop", loss=loss_mean_absolute_percentage_error, metrics=c("mae"))
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("mape, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     if(losstype=="logcosh"){
       nnmodel %>% 
-        compile(optimizer="rmsprop", loss=keras::loss_logcosh, metrics=c("mae"))
+        compile(optimizer="rmsprop", loss=loss_logcosh, metrics=c("mae"))
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("logsoch, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     # second, custom symmetric losses
     if(losstype=="mspe"){ 
       nnmodel %>% 
-        compile(optimizer="rmsprop", loss=mspe, metrics=c("mae"))
+        compile(optimizer="rmsprop", loss=mspe, metrics=c("mae"), callbacks=callbacks)
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("mspe, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     if(losstype=="male"){ # custom mean log absolute error
       nnmodel %>% 
-        compile(optimizer="rmsprop", loss=male, metrics=c("mae"))
+        compile(optimizer="rmsprop", loss=male, metrics=c("mae"), callbacks=callbacks)
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("male, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     if(losstype=="msale"){ # custom mean squared log absolute error
       nnmodel %>% 
         compile(optimizer="rmsprop", loss=msale, metrics=c("mae"))
       nnmodel %>% 
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
       predictions <- nnmodel %>% predict(testsetpvs)
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("msale, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
     
     # third, custom asymmetric losses
     # in fitting, make sure batch_size = nrow(train_x), shuffle = FALSE so that (y_true,y_pred) actually line up to the same observations. We need this because we have flood/drought designations. Also, we cannot have a validation split if the batch_size is now the whole training set.
-    # This is not working inside the function environment, because trainsetpvs2 is only saved inside the this function and not in global, so the wrapper is not able to locate it. So, let's take the easy way out and just take the asymmetric part out of the function and run the code chunk below instead.
+    # This is not working inside the function environment, because trainset$FLOOD is only saved inside the this function and not in global, so the wrapper is not able to locate it. So, let's take the easy way out and just take the asymmetric part out of the function and run the code chunk below instead.
     if(losstype=="wlse"){
       nnmodel %>% 
         compile(optimizer="rmsprop", loss=wlse_wrapper_stochastic, metrics=c("mae"))
       nnmodel %>% 
         fit(trainsetpvs, trainsetrv, epochs=1000, batch_size=nrow(trainsetpvs), shuffle=FALSE, verbose=1)
-        predictions <- nnmodel %>% predict(testsetpvs)
-        predictions <- predictions[ , 1] 
-        results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
-        modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("wlse, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
 
     if(losstype=="linexe"){
@@ -369,10 +370,8 @@ nnloss <- function(data, losstype){
       predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("linexe, logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
     }
-    
-    # check progress of the loop
-    print(paste0("k=", k, ", Basin=", h))
   }
   
   names_tbd <- rownames(modgof[[1]])
@@ -399,7 +398,7 @@ nnloss <- function(data, losstype){
 # nn_logo_msale_results <- nnloss(moddf, "msale")
 # saveRDS(nn_logo_msale_results, file="Output Data/rds/nn_logo_msale_results.RDS")
 
-# not working, run code chunk below instead
+# # not working, run code chunk below instead
 # nn_logo_wlse_results <- nnloss(moddf, "wlse")
 # saveRDS(nn_logo_wlse_results, file="Output Data/rds/nn_logo_wlse_results.RDS")
 # nn_logo_linexe_results <- nnloss(moddf, "linexe")
@@ -407,7 +406,7 @@ nnloss <- function(data, losstype){
 ```
 
 ```{r nn_wlse}
-# # function environments not saving trainsetpvs2 for some reason. Let's try outside of the nnloss function
+# # function environments not passing in trainset$FLOOD. Let's try outside of the nnloss function
 # optimmodel <- results <- modgof <- list()
 # for (k in 1:(length(unique(moddf$CDEC_ID)))){
 #   h <- unique(moddf$CDEC_ID)[k]
@@ -424,34 +423,30 @@ nnloss <- function(data, losstype){
 #   floodlvl_mean <- aggregate(PPT~CDEC_ID, data=trainset, FUN=mean)
 #   colnames(floodlvl_mean)[2] <- "FLVL_MEAN"
 #   trainset <- merge(trainset, floodlvl_mean, by="CDEC_ID")
-#   trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0)
-#   trainsetpvs2 <- as.matrix(trainset[,c(10, 13:36, 39)])
-#   trainsetrv2 <- as.matrix(trainset$FLOW)
+#   trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0) # this gets passed into the wrappers
 # 
-#   # normalize the training set on standard deviation, then normalize testset by using mean and SD of training set so no leaks happen
-#   scale_par <- preProcess(trainsetpvs, method=c("scale"))
-#   trainsetpvs_scaled <- data.frame(predict(scale_par, trainsetpvs))
-#   testsetpvs_scaled <- predict(scale_par, testsetpvs) # this should remain a matrix
-#   # add in the flood column, since the data wasn't shuffled just columnbind
-#   trainsetpvs_scaled2 <- trainsetpvs_scaled
-#   trainsetpvs_scaled2$FLOOD <- trainset$FLOOD
-#   trainsetpvs_scaled2 <- as.matrix(trainsetpvs_scaled2) # back to matrix form
-#   trainsetpvs_scaled <- as.matrix(trainsetpvs_scaled)
-# 
-#   # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
-#   nnmodel <- keras_model_sequential() %>% # use: "relu", "sigmoid", "softmax"
-#     layer_dense(units=64, activation="relu", input_shape=dim(trainsetpvs)[[2]]) %>%
+#   # define the model
+#   nfeat <- dim(moddf[,c(10,13:(ncol(moddf)-1))])[2]
+#   nnmodel <- keras_model_sequential() %>%
+#     layer_dense(units=64, activation="relu", input_shape=nfeat) %>%
 #     layer_dense(units=64, activation="relu") %>%
-#     layer_dense(units=1) # number of outputs, here we just want one prediction
+#     layer_dense(units=1)
+# 
+#   # # define callbacks, can't use this because it needs a validation set
+#   # callbacks <- list(callback_early_stopping(patience=10, mode="min", restore_best_weights=TRUE))
 # 
 #   nnmodel %>%
 #     compile(optimizer="rmsprop", loss=wlse_wrapper_stochastic, metrics=c("mae"))
 #   nnmodel %>%
 #     fit(trainsetpvs, trainsetrv, epochs=1000, batch_size=nrow(trainsetpvs), shuffle=FALSE, verbose=1)
+# 
 #   predictions <- nnmodel %>% predict(testsetpvs)
 #   predictions <- predictions[ , 1]
 #   results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
 #   modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+# 
+#   # check progress of the loop
+#   print(paste0("k=", k, ", Basin=", h, ", modgof=", modgof[[k]]["bR2",]))
 # }
 # 
 # names_tbd <- rownames(modgof[[1]])
@@ -467,52 +462,47 @@ nnloss <- function(data, losstype){
 ```
 
 ```{r nn_linexe}
-# # function environments not savind trainsetpvs2 for some reason. Let's try outside of the nnloss function
+# # function environments not passing in trainset$FLOOD. Let's try outside of the nnloss function
 # optimmodel <- results <- modgof <- list()
 # for (k in 1:(length(unique(moddf$CDEC_ID)))){
 #   h <- unique(moddf$CDEC_ID)[k]
 #   testset <- moddf[moddf$CDEC_ID==h,]
 #   trainset <- moddf[moddf$CDEC_ID!=h,]
 # 
-#   # for symmetric losses: seperate into predictor variables and response variable
-#   testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
-#   trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+#   # for symmetric losses: separate into predictor variables and response variable
+#   testsetpvs <- as.matrix(testset[,c(10, 13:(ncol(testset)-1))])
+#   trainsetpvs <- as.matrix(trainset[,c(10, 13:(ncol(trainset)-1))])
 #   testsetrv <- as.matrix(testset$FLOW)
 #   trainsetrv <- as.matrix(trainset$FLOW)
 # 
 #   # for asymmetric losses: designate each observation as a flood:1 or a drought:0 for asymmetric losses
 #   floodlvl_mean <- aggregate(PPT~CDEC_ID, data=trainset, FUN=mean)
-#   # floodlvl_median <- aggregate(PPT~CDEC_ID, data=trainset, FUN=median) # let's try median
 #   colnames(floodlvl_mean)[2] <- "FLVL_MEAN"
 #   trainset <- merge(trainset, floodlvl_mean, by="CDEC_ID")
-#   trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0)
-#   trainsetpvs2 <- as.matrix(trainset[,c(10, 13:36, 39)])
-#   trainsetrv2 <- as.matrix(trainset$FLOW)
+#   trainset$FLOOD <- ifelse(trainset$PPT>trainset$FLVL_MEAN, 1, 0) # this gets passed into the wrappers
 # 
-#   # normalize the training set on standard deviation, then normalize testset by using mean and SD of training set so no leaks happen
-#   scale_par <- preProcess(trainsetpvs, method=c("scale"))
-#   trainsetpvs_scaled <- data.frame(predict(scale_par, trainsetpvs))
-#   testsetpvs_scaled <- predict(scale_par, testsetpvs) # this should remain a matrix
-#   # add in the flood column, since the data wasn't shuffled just columnbind
-#   trainsetpvs_scaled2 <- trainsetpvs_scaled
-#   trainsetpvs_scaled2$FLOOD <- trainset$FLOOD
-#   trainsetpvs_scaled2 <- as.matrix(trainsetpvs_scaled2) # back to matrix form
-#   trainsetpvs_scaled <- as.matrix(trainsetpvs_scaled)
-# 
-#   # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
-#   nnmodel <- keras_model_sequential() %>% # use: "relu", "sigmoid", "softmax"
-#     layer_dense(units=64, activation="relu", input_shape=dim(trainsetpvs)[[2]]) %>%
+#   # define the model
+#   nfeat <- dim(moddf[,c(10,13:(ncol(moddf)-1))])[2]
+#   nnmodel <- keras_model_sequential() %>%
+#     layer_dense(units=64, activation="relu", input_shape=nfeat) %>%
 #     layer_dense(units=64, activation="relu") %>%
-#     layer_dense(units=1) # number of outputs, here we just want one prediction
+#     layer_dense(units=1)
+# 
+#   # # define callbacks, can't use this because it needs a validation set
+#   # callbacks <- list(callback_early_stopping(patience=10, mode="min", restore_best_weights=TRUE))
 # 
 #   nnmodel %>%
 #     compile(optimizer="rmsprop", loss=linexe_wrapper_stochastic, metrics=c("mae"))
 #   nnmodel %>%
-#     fit(trainsetpvs, trainsetrv, epochs=1000, verbose=1, batch_size=nrow(trainsetpvs), shuffle=FALSE)
+#     fit(trainsetpvs, trainsetrv, epochs=1000, batch_size=nrow(trainsetpvs), shuffle=FALSE, verbose=1)
+# 
 #   predictions <- nnmodel %>% predict(testsetpvs)
 #   predictions <- predictions[ , 1]
 #   results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
 #   modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+# 
+#   # check progress of the loop
+#   print(paste0("k=", k, ", Basin=", h, ", modgof=", modgof[[k]]["bR2",]))
 # }
 # 
 # names_tbd <- rownames(modgof[[1]])
@@ -538,18 +528,6 @@ nn_logo_male_results <- readRDS(file="Output Data/rds/nn_logo_male_results.RDS")
 nn_logo_msale_results <- readRDS(file="Output Data/rds/nn_logo_msale_results.RDS")
 nn_logo_wlse_results <- readRDS("Output Data/rds/nn_logo_wlse_results.RDS")
 nn_logo_linexe_results <- readRDS("Output Data/rds/nn_logo_linexe_results.RDS")
-
-# quick check on the results
-mean(unlist(nn_logo_mse_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_mae_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_msle_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_mape_results[["gof"]]["bR2", ]), na.rm=TRUE)
-mean(unlist(nn_logo_logcosh_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_mspe_results[["gof"]]["bR2", ]), na.rm=TRUE)
-mean(unlist(nn_logo_male_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_msale_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_wlse_results[["gof"]]["bR2", ]))
-mean(unlist(nn_logo_linexe_results[["gof"]]["bR2", ]))
 ```
 
 # 5.0 LOGO Post Processing 
@@ -564,6 +542,7 @@ pp_results <- function(resultsls, resultsdf, modeltype, losstype){
   results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
   if(modeltype=="nn"){
     nsubsetting <- results_unlisted$nforstitch
+    # nsubsetting <- ifelse(is.null(nsubsetting), as.numeric(rownames(results_unlisted)), nsubsetting) # rownames should do for logo
     }
   if(modeltype=="lm"){
     nsubsetting <- as.numeric(rownames(results_unlisted))
@@ -730,7 +709,7 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
     # create a second axis with sec_axis() and format the labels to display the original precipitation units
     scale_y_continuous(name = "Discharge (cfs)", sec.axis = sec_axis(trans = ~1*(.-maxRange), name = "Precipitation (in/d)", labels = precip_labels)) # labels are in inches/d
     
-  png(paste0('Output Data/ts_loss/timeseries_nn_', h, '.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+  png(paste0('Output Data/ts_loss/timeseries_nn_', h, '.png'), width=6.5, height=8, units="in", pointsize=8, res=300)
     print(hydrograph)
   dev.off()
 }
@@ -807,7 +786,7 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
     # create a second axis with sec_axis() and format the labels to display the original precipitation units
     scale_y_continuous(name = "Discharge (cfs)", sec.axis = sec_axis(trans = ~1*(.-maxRange), name = "Precipitation (in/d)", labels = precip_labels)) # labels are in inches/d
     
-  png(paste0('Output Data/ts_loss_zoomed/timeseries_nn_', h, '.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+  png(paste0('Output Data/ts_loss_zoomed/timeseries_nn_', h, '.png'), width=6.5, height=8, units="in", pointsize=8, res=300)
     print(hydrograph)
   dev.off()
 }
@@ -1181,7 +1160,7 @@ gofdotchart <- function(gof_results_mse, gof_results_logcosh, gof_results_mae, g
   basinscm$LOSS_FUNCTION <- factor(basinscm$LOSS_FUNCTION, levels = c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"))
 
   plottoprint <- ggplot(data=basinscm, aes(x=VALUE, y=CDEC_ID)) +
-      geom_point(aes(shape=LOSS_FUNCTION, color=LOSS_FUNCTION), size=4)+
+      geom_point(aes(shape=LOSS_FUNCTION, color=LOSS_FUNCTION), size=2)+
       scale_shape_manual(breaks = c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE"), values=c(4, 2, 5, 8, 16, 15)) + 
       scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[6], cbpblack[8], cbpblack[5], cbpblack[3], cbpblack[7], cbpblack[2]), breaks = c("MSE", "LOGCOSH", "MAE", "MSPE", "WLSE", "LINEXE")) +
       labs(x=fitofinterestlabel, y="")+
@@ -1189,7 +1168,7 @@ gofdotchart <- function(gof_results_mse, gof_results_logcosh, gof_results_mae, g
       theme(legend.position="bottom", legend.title = element_blank())+
       guides(color = guide_legend(nrow = 1), shape= guide_legend(nrow = 1))
   
-  png(paste0('Output Data/rplot36_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=8, units="in", pointsize=8, res=1200)
+  png(paste0('Output Data/rplot36_', modeltype, "_", fitofinterest, 'dotchart_comp.png'), width=6.5, height=4, units="in", pointsize=8, res=300)
     print(plottoprint)
   dev.off()
 }

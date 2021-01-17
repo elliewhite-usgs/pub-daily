@@ -11,4 +11,5 @@
 # files I don't want on github
 /Input Data
 /Output Data/rds
+/Output Data/vi_models
 intro to ml.mp4 

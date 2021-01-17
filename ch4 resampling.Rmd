@@ -59,15 +59,17 @@ moddf <- readRDS('Intermediary Data/moddf.rds')
 ```
 
 ```{r data_gathering_extra}
+library(raster)
+library(sp)
+library(rgdal)
+library(dismo)
+
 # some helpful dataframes, may come in handy later for post processing
 sptdf <- df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
 
 coordinates(sptdf) <- ~LONGITUDE + LATITUDE
 proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
 
-library(rgdal)
-library(sp)
-library(raster)
 basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily.shp')
 caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
 cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
@@ -441,7 +443,7 @@ rf_logo_results <- readRDS("Output Data/rds/rf_logo_results.RDS")
 rf_lmgo_results <- readRDS("Output Data/rds/rf_lmgo_results.RDS")
 ```
 
-## 4.4 NN
+## 4.4 NN 
 ```{r nn_setup}
 # # install and set up our environment for deep learning
 # devtools::install_github("rstudio/reticulate")
@@ -449,7 +451,7 @@ rf_lmgo_results <- readRDS("Output Data/rds/rf_lmgo_results.RDS")
 # devtools::install_github("rstudio/tensorflow")
 
 library(keras)
-install_keras(tensorflow = "1.12")
+install_keras()
 
 # # example to see if the installation works
 # mnist <- dataset_mnist()
@@ -467,49 +469,72 @@ install_keras(tensorflow = "1.12")
 #           optimizer = "adam",
 #           metrics = "accuracy")
 # 
-# print_dot_callback <- callback_lambda(
-#   on_epoch_end = function(epoch, logs) {
-#     if (epoch %% 10 == 0) cat("\n")
-#     cat(".")
-#   }
-# )
-# 
 # model %>%
 #   fit(
 #     x = mnist$train$x,
 #     y = mnist$train$y,
 #     epochs = 5,
 #     validation_split = 0.3,
-#     verbose = 0,
-#     callbacks = list(print_dot_callback)
+#     verbose = TRUE,
 #   )
 ```
 
-```{r nn_modeling_and_cv}
-nncv <- function(data, groupingstyle, datatype){
-  # the model network includes two layers of fully-connected relu activated neurons, and an output layer with no transformation. units are the number of hidden nodes
-  trainingdim <- dim(data[,c(10,13:(ncol(data)-1))])
+### 4.4.1 NN - 2 Layer Dense Fully Connected, Standardized Predictor Variables (No Early Stopping or Dropout)
+```{r nns_modeling_and_cv}
+nnscv <- function(data, groupingstyle){
+  nfeat <- dim(data[,c(10,13:(ncol(data)-1))])[2]
+  
+  # define the model
   nnmodel <- keras_model_sequential() %>%
-  layer_dense(units=64, activation="relu", input_shape=trainingdim[[2]]) %>%
-  layer_dense(units=64, activation="relu") %>%
-  layer_dense(units=1) # number of outputs, here we just want one prediction
+    layer_dense(units=64, activation="tanh", input_shape=nfeat) %>%
+    layer_dense(units=64, activation="exponential") %>%
+    layer_dense(units=1)
+  
+  # can define with relu activations
+  # nnmodel <- keras_model_sequential() %>%
+  #   layer_dense(units=64, activation="relu", input_shape=nfeat) %>%
+  #   layer_dense(units=64, activation="relu") %>%
+  #   layer_dense(units=1)
+  
+  # # can define with dropout, but it doesn't help the error, maybe because it needs larger units
+  # nnmodel <- keras_model_sequential() %>%
+  #   layer_dense(units=64+13, activation="tanh", input_shape=nfeat) %>%
+  #   layer_dropout(rate = 0.20) %>% 
+  #   layer_dense(units=64+7, activation="exponential") %>%
+  #   layer_dropout(rate = 0.10) %>% 
+  #   layer_dense(units=1)
+  
+  # compile 
+  nnmodel %>%
+    compile(optimizer=optimizer_adam(clipnorm = TRUE, clipvalue = 1), loss=loss_mean_squared_error, metrics=c("mae"))
+  
+  # define a callback for early stopping
+  callbacks <- list(callback_early_stopping(patience=10, mode="min", restore_best_weights=TRUE)) # if you add this you have to make sure lr resets after every loop!!! callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.1, patience=10)
 
-  nnmodel %>% # to compile the model, loss functions are defined here
-    compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
-
-  # for resubstitution, where testing data and training data is the same
+  # for resubstitution, where testing data and training data is the same-----------------------------------------
   if(groupingstyle=="resub"){
     trainsetpvs <- as.matrix(data[,c(10,13:(ncol(data)-1))])
     trainsetrv <- as.matrix(data$FLOW)
-    nnmodel %>%  # this is to fit the model coefficients
-      fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+    
+    # mean-standard deviation normalization. First, find mean and sd column-wise of training data
+    trainmean <- apply(trainsetpvs, 2, mean)
+    trainsd <- apply(trainsetpvs, 2, sd)
+
+    # to just center: sweep(trainsetpvs, 2L, trainmean, FUN="-"), but we want to center and normalize by sd
+    trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+    
+    nnmodel %>% 
+      fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2, callbacks=callbacks)
+    
+    # make predictions 
     predictions <- nnmodel %>% predict(trainsetpvs)
-    predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+    predictions <- predictions[ , 1] 
     results <- cbind(obs=trainsetrv[ , 1], pred=predictions)
     modgof <- gof(as.data.frame(results)$pred, as.data.frame(results)$obs)
+    print(paste0("resub modgof=", modgof))
   }
 
-  # for k-fold cross validation
+  # for k-fold cross validation---------------------------------------------------------------------------------
   if(is.integer(groupingstyle)){
     group <- kfold(data, groupingstyle)
     results <- modgof <- list()
@@ -517,25 +542,34 @@ nncv <- function(data, groupingstyle, datatype){
       trainset <- data[group != k, ]
       testset <- data[group == k, ]
 
-      # seperate into predictor variables and response variable
-      testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
-      trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+      # separate into predictor variables and response variable
+      testsetpvs <- as.matrix(testset[, c(10,13:(ncol(testset)-1))])
+      trainsetpvs <- as.matrix(trainset[, c(10,13:(ncol(trainset)-1))])
       testsetrv <- as.matrix(testset$FLOW)
       trainsetrv <- as.matrix(trainset$FLOW)
-
+      
+      # mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)!
+      trainmean <- apply(trainsetpvs, 2, mean)
+      trainsd <- apply(trainsetpvs, 2, sd)
+      trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+      testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+      
       nnmodel %>%
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
+      
       predictions <- nnmodel %>% predict(testsetpvs)
-      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset))) # adding rownames here for later stitching the dataset back to its original shape
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("kfold k=", k, ", modgof=", modgof[[k]]["bR2",]))
     }
+    
     names_tbd <- rownames(modgof[[1]])
     modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
     rownames(modgof) <- names_tbd
   }
 
-  # for leave one group (basin) out cross validation
+  # for leave one group (basin) out cross validation------------------------------------------------------------
   if(groupingstyle=="logo"){
     results <- modgof <- list()
 
@@ -547,12 +581,211 @@ nncv <- function(data, groupingstyle, datatype){
       trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
       testsetrv <- as.matrix(testset$FLOW)
       trainsetrv <- as.matrix(trainset$FLOW)
-
+      
+      # mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)!
+      trainmean <- apply(trainsetpvs, 2, mean)
+      trainsd <- apply(trainsetpvs, 2, sd)
+      trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+      testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+      
       nnmodel %>%
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2, callbacks=callbacks)
+      
       predictions <- nnmodel %>% predict(testsetpvs)
-      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      predictions <- predictions[ , 1] 
       results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("logo k=", k, ", h=", h, ", modgof=", modgof[[k]]["bR2",]))
+    }
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+    colnames(modgof) <- unique(data$CDEC_ID)
+  }
+
+  # for random 5-fold leave multiple groups out cross validation, meaning a random 1/5 of the basins will be left out of training-------------------------------------------------------------------------------------------------
+  if(groupingstyle=="lmgo"){
+    nfolds <- 5
+    group <- as.data.frame(unique(data$CDEC_ID))
+    colnames(group) <- "CDEC_ID"
+    group$kftrain <- kfold(nrow(group), nfolds)
+    data <- merge(data, group, by="CDEC_ID")
+
+    results <- modgof <- list()
+    for(k in 1:nfolds) {
+      testset <- data[data$kftrain == k, ]
+      trainset <- data[data$kftrain != k, ]
+      testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-2))])
+      trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-2))])
+      testsetrv <- as.matrix(testset$FLOW)
+      trainsetrv <- as.matrix(trainset$FLOW)
+      
+      # mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)!
+      trainmean <- apply(trainsetpvs, 2, mean)
+      trainsd <- apply(trainsetpvs, 2, sd)
+      trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+      testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+      
+      nnmodel %>%
+        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2)
+      
+      predictions <- nnmodel %>% predict(testsetpvs)
+      predictions <- predictions[ , 1] 
+      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+      print(paste0("lmgo k=", k, ", modgof=", modgof[[k]]["bR2",]))
+    }
+    
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+  }
+
+  if(groupingstyle=="resub"){
+    list(results=results, gof=modgof)
+  } else if(groupingstyle=="logo"){
+    list(results=results, gof=modgof)
+  } else{
+    list(results=results, gof=modgof, kf=group)
+  }
+}
+
+# nns_resub_results <- nnscv(moddf, "resub")
+# saveRDS(nns_resub_results, file="Output Data/rds/nns_resub_results.RDS")
+# nns_2fold_results <- nnscv(moddf, 2L)
+# saveRDS(nns_2fold_results, file="Output Data/rds/nns_2fold_results.RDS")
+# nns_5fold_results <- nnscv(moddf, 5L)
+# saveRDS(nns_5fold_results, file="Output Data/rds/nns_5fold_results.RDS")
+# nns_10fold_results <- nnscv(moddf, 10L)
+# saveRDS(nns_10fold_results, file="Output Data/rds/nns_10fold_results.RDS")
+# nns_logo_results <- nnscv(moddf, "logo")
+# saveRDS(nns_logo_results, file="Output Data/rds/nns_logo_results.RDS")
+# nns_lmgo_results <- nnscv(moddf, "lmgo")
+# saveRDS(nns_lmgo_results, file="Output Data/rds/nns_lmgo_results.RDS")
+
+nns_resub_results <- readRDS("Output Data/rds/nns_resub_results.RDS")
+nns_2fold_results <- readRDS("Output Data/rds/nns_2fold_results.RDS")
+nns_5fold_results <- readRDS("Output Data/rds/nns_5fold_results.RDS")
+nns_10fold_results <- readRDS("Output Data/rds/nns_10fold_results.RDS")
+nns_logo_results <- readRDS("Output Data/rds/nns_logo_results.RDS")
+nns_lmgo_results <- readRDS("Output Data/rds/nns_lmgo_results.RDS")
+```
+
+### 4.4.2 LSTM + 2 Layer Dense Fully Connected, Standardized Predictor Variables (No Early Stopping or Dropout)
+Predictor $X$ is a 3D matrix:
+1. total # of samples = 19
+2. sequence length per sample = 5386 
+3. # of features
+
+Response $Y$ is a 3D matrix:
+1. total # of samples = 19
+2. # of timesteps to predict = 1 (the last one, many to one architecture) 
+3. # of target variables = 1 (flow)
+
+Use a rolling window to have more samples than just the number of basins. 
+Note: the parameters have not been optimized.
+
+```{r lstm_modeling_and_cv}
+library(reshape2)
+
+# output of the make array function is in dimensions of [nbasins, tsteps, nfeat]
+makearray <- function(tset, tsetpvs){ 
+  tset_long <- melt(tset, id.vars=c("CDEC_ID", "DATE"), measure.vars=c(colnames(tsetpvs), "FLOW"), variable.name="VARS", value.name="VALUE")
+  tset_list <- split(tset_long, tset_long$VARS)
+  tset_list <- lapply(tset_list, function(x) x[!(names(x) %in% "VARS")]) # drop the VARS column
+  tset_list <- lapply(tset_list, function(x) dcast(x, CDEC_ID~DATE, value.var = "VALUE")) # make dates as columns
+  tset_list <- lapply(tset_list, function(x) x[!(names(x) %in% "CDEC_ID")]) # drop the CDEC_ID column
+  tset_array <- array(unlist(tset_list), dim=c(dim(tset_list[[1]]), length(tset_list)))
+}
+
+# the 3D output of the makearray function is turned into a sliding window for the LSTM in dimensions of [nbasins*(tsteps-ncells+1), ncells, nfeat] 
+reshapearray <- function(tset_array, ncells){
+  nbasins <- dim(tset_array)[1]
+  tsteps <- dim(tset_array)[2]
+  nfeat <- dim(tset_array)[3]
+  new_tset_array <- array(NA, dim=c(nbasins*(tsteps-ncells+1), ncells, nfeat))
+  for(i in 1:nbasins){
+    for (j in 1:(tsteps-ncells+1)){
+      for (n in 1:ncells){
+        for (k in 1:nfeat){
+        new_tset_array[(i-1)*(tsteps-ncells+1)+j, n, k] <- tset_array[i, j+n-1, k]
+        }      
+      }
+    }
+  }
+  return(new_tset_array)
+}
+
+lstmcv <- function(data, groupingstyle){
+  nbasins <- length(unique(data$CDEC_ID))
+  tsteps <- aggregate(FLOW~CDEC_ID, data=data, FUN=length)[1, 2] # should be the same for all basins
+  nfeat <- dim(data[,c(10,13:(ncol(data)-1))])[2]
+  ncells <- 5
+  
+  nnmodel <- keras_model_sequential() %>%
+  layer_lstm(units = 64, input_shape = c(ncells, nfeat), return_sequences = FALSE) %>% # return_sequences = FALSE in the many-to-one lstm architecture. many-to-many is TRUE. stateful = TRUE is an LSTM without having to define the window
+  layer_dense(units = 64, activation = "tanh") %>% 
+  layer_dense(units = 64, activation = "exponential") %>% 
+  layer_dense(units = 1)
+
+  nnmodel %>% # to compile the model, loss functions are defined here
+    compile(optimizer = optimizer_adam(clipnorm = TRUE, clipvalue = 1), loss = loss_mean_squared_error, metrics = c("mae"))
+  
+  # define a callback for early stopping
+  callbacks <- list(callback_early_stopping(patience=10, mode="min", restore_best_weights=TRUE))
+
+  # for leave one group (basin) out cross validation
+  if(groupingstyle=="logo"){
+    results <- modgof <- list()
+
+    for (k in 1:(length(unique(data$CDEC_ID)))){
+      h <- unique(data$CDEC_ID)[k]
+      trainset <- data[data$CDEC_ID!=h,]
+      testset <- data[data$CDEC_ID==h,]
+      
+      trainsetpvs <- trainset[,c(10,13:(ncol(trainset)-1))]
+      testsetpvs <- testset[,c(10,13:(ncol(testset)-1))]
+      
+      # mean-standard deviation normalization
+      ## find mean and sd column-wise of training data
+      trainmean <- apply(trainsetpvs, 2, mean)
+      trainsd <- apply(trainsetpvs, 2, sd)
+
+      ## to just center: sweep(trainsetpvs, 2L, trainmean, FUN="-")
+      ## centered and scaled, note that testset is centered by trainset mean and sd (no leakage)!
+      trainsetpvs_normalized <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+      testsetpvs_normalized <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+      
+      # make new dataframes with the normalized predictor variables
+      trainset <- cbind(CDEC_ID=trainset$CDEC_ID, DATE=trainset$DATE, trainsetpvs_normalized, FLOW=trainset$FLOW)
+      testset <- cbind(CDEC_ID=testset$CDEC_ID, DATE=testset$DATE, testsetpvs_normalized, FLOW=testset$FLOW)
+      
+      # make matrices, note that only predictor variables get normalized
+      trainsetpvs <- as.matrix(trainsetpvs_normalized)
+      testsetpvs <- as.matrix(testsetpvs_normalized)
+      trainsetrv <- as.matrix(trainset$FLOW)
+      testsetrv <- as.matrix(testset$FLOW)
+      
+      # make an array out of matrices
+      trainset_array <- makearray(trainset, trainsetpvs)
+      testset_array <- makearray(testset, testsetpvs)
+      
+      # reshape arrays into moving window for LSTM training
+      trainset_array_window <- reshapearray(trainset_array, 5)
+      testset_array_window <- reshapearray(testset_array, 5)
+      
+      # split into predictor variables and response variables
+      trainsetpv_array <- trainset_array_window[ , , 1:nfeat]
+      trainsetrv_array <- trainset_array_window[ , , nfeat+1]
+      testsetpv_array <- testset_array_window[ , , 1:nfeat]
+      testsetrv_array <- testset_array_window[ , , nfeat+1]
+      
+      nnmodel %>%
+        fit(trainsetpv_array, trainsetrv_array, epochs = 100, verbose=1, batch_size=320, validation_split = 0.2, shuffle = FALSE, callbacks=callbacks) # the number of samples, here it is 96,876,  needs to be divisible by batch_size. Validation_split needs to be a multiple of batch_size. Shuffle=FALSE so the cells build up state along the sequences. 
+      
+      predictions <- nnmodel %>% predict(testsetpv_array)
+      predictions <- predictions[ , 1]
+      results[[k]] <- cbind(obs=testsetrv_array[, ncells], pred=predictions)
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
     }
     names_tbd <- rownames(modgof[[1]])
@@ -571,130 +804,139 @@ nncv <- function(data, groupingstyle, datatype){
 
     results <- modgof <- list()
     for(k in 1:nfolds) {
-      testset <- data[data$kftrain == k, ]
       trainset <- data[data$kftrain != k, ]
-      testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-2))])
-      trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-2))])
-      testsetrv <- as.matrix(testset$FLOW)
+      testset <- data[data$kftrain == k, ]
+      
+      trainsetpvs <- trainset[,c(10,13:(ncol(trainset)-1))]
+      testsetpvs <- testset[,c(10,13:(ncol(testset)-1))]
+      
+      # mean-standard deviation normalization
+      ## find mean and sd column-wise of training data
+      trainmean <- apply(trainsetpvs, 2, mean)
+      trainsd <- apply(trainsetpvs, 2, sd)
+
+      ## to just center: sweep(trainsetpvs, 2L, trainmean, FUN="-")
+      ## centered and scaled, note that testset is centered by trainset mean and sd (no leakage)!
+      trainsetpvs_normalized <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+      testsetpvs_normalized <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+      
+      # make new dataframes with the normalized predictor variables
+      trainset <- cbind(CDEC_ID=trainset$CDEC_ID, DATE=trainset$DATE, trainsetpvs_normalized, FLOW=trainset$FLOW)
+      testset <- cbind(CDEC_ID=testset$CDEC_ID, DATE=testset$DATE, testsetpvs_normalized, FLOW=testset$FLOW)
+      
+      # make matrices, note that only predictor variables get normalized
+      trainsetpvs <- as.matrix(trainsetpvs_normalized)
+      testsetpvs <- as.matrix(testsetpvs_normalized)
       trainsetrv <- as.matrix(trainset$FLOW)
+      testsetrv <- as.matrix(testset$FLOW)
+      
+      # make an array out of matrices
+      trainset_array <- makearray(trainset, trainsetpvs)
+      testset_array <- makearray(testset, testsetpvs)
+      
+      # reshape arrays into moving window for LSTM training
+      trainset_array_window <- reshapearray(trainset_array, 5)
+      testset_array_window <- reshapearray(testset_array, 5)
+      
+      # split into predictor variables and response variables
+      trainsetpv_array <- trainset_array_window[ , , 1:nfeat]
+      trainsetrv_array <- trainset_array_window[ , , nfeat+1]
+      testsetpv_array <- testset_array_window[ , , 1:nfeat]
+      testsetrv_array <- testset_array_window[ , , nfeat+1]
 
       nnmodel %>%
-        fit(trainsetpvs, trainsetrv, epochs=100, batch_size=25, verbose=1, validation_split=0.2)
-      predictions <- nnmodel %>% predict(testsetpvs)
-      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
-      results[[k]] <- cbind(obs=testsetrv[ , 1], pred=predictions, nforstitch=as.numeric(rownames(testset)))
+        fit(trainsetpv_array, trainsetrv_array, epochs = 100, verbose=1, batch_size=320, validation_split = 0.2, shuffle = FALSE, callbacks=callbacks)
+      
+      predictions <- nnmodel %>% predict(testsetpv_array)
+      predictions <- predictions[ , 1]
+      results[[k]] <- cbind(obs=testsetrv_array[, ncells], pred=predictions)
       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
     }
+    
     names_tbd <- rownames(modgof[[1]])
     modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
     rownames(modgof) <- names_tbd
   }
 
-  if(groupingstyle=="resub"){
+  if(groupingstyle=="logo"){
     list(results=results, gof=modgof)
-  } else if(groupingstyle=="logo"){
-    list(results=results, gof=modgof)
-  } else{
+  } else if(groupingstyle=="lmgo"){
     list(results=results, gof=modgof, kf=group)
+  } else{
+    print("not a valid groupingstyle!")
   }
 }
 
-# nn_resub_results <- nncv(moddf, "resub")
-# saveRDS(nn_resub_results, file="Output Data/rds/nn_resub_results.RDS")
-# nn_2fold_results <- nncv(moddf, 2L)
-# saveRDS(nn_2fold_results, file="Output Data/rds/nn_2fold_results.RDS")
-# nn_5fold_results <- nncv(moddf, 5L)
-# saveRDS(nn_5fold_results, file="Output Data/rds/nn_5fold_results.RDS")
-# nn_10fold_results <- nncv(moddf, 10L)
-# saveRDS(nn_10fold_results, file="Output Data/rds/nn_10fold_results.RDS")
-# nn_logo_results <- nncv(moddf, "logo")
-# saveRDS(nn_logo_results, file="Output Data/rds/nn_logo_results.RDS")
-# nn_lmgo_results <- nncv(moddf, "lmgo")
-# saveRDS(nn_lmgo_results, file="Output Data/rds/nn_lmgo_results.RDS")
-
-nn_resub_results <- readRDS("Output Data/rds/nn_resub_results.RDS")
-nn_2fold_results <- readRDS("Output Data/rds/nn_2fold_results.RDS")
-nn_5fold_results <- readRDS("Output Data/rds/nn_5fold_results.RDS")
-nn_10fold_results <- readRDS("Output Data/rds/nn_10fold_results.RDS")
-nn_logo_results <- readRDS("Output Data/rds/nn_logo_results.RDS")
-nn_lmgo_results <- readRDS("Output Data/rds/nn_lmgo_results.RDS")
+# lstm_logo_results <- lstmcv(moddf, "logo")
+# saveRDS(lstm_logo_results, file="Output Data/rds/lstm_logo_results.RDS")
+# lstm_lmgo_results <- lstmcv(moddf, "lmgo")
+# saveRDS(lstm_lmgo_results, file="Output Data/rds/lstm_lmgo_results.RDS")
+# 
+# lstm_logo_results <- readRDS("Output Data/rds/lstm_logo_results.RDS")
+# lstm_lmgo_results <- readRDS("Output Data/rds/lstm_lmgo_results.RDS")
 ```
 
+### 4.4.3 NN for Timeseries
+!!! NOT for PUB where the ungauged basin is in space. For PUB when there's a timeseries or a forecast that is of interest. 
 ```{r nn_different_architecture}
-library(reshape2)
-# nncv2 <- function(data, groupingstyle){
-#   if(groupingstyle=="logo"){
-#     results <- modgof <- list()
-# 
-#     for (k in 1:(length(unique(data$CDEC_ID)))){
-#       data <- data[order(data$DATE), ] # order data by timeseries
-#       h <- unique(data$CDEC_ID)[k]
-#       testset <- data[data$CDEC_ID==h, ]
-#       trainset <- data[data$CDEC_ID!=h, ]
-#       testsetpvs <- as.matrix(testset[ , c(13:(ncol(testset)-1))])
-#       trainsetpvs <- as.matrix(trainset[ , c(13:(ncol(trainset)-1))])
-#       testsetrv <- as.matrix(testset$FLOW)
-#       trainsetrv <- as.matrix(trainset$FLOW)
-#       
-#       library(reshape2)
-#       makearray <- function(tset, tsetpvs){
-#         tset_long <- melt(tset, id.vars=c("CDEC_ID", "DATE"), measure.vars=c(colnames(tsetpvs), "FLOW"), variable.name="VARS", value.name="VALUE")
-#         tset_list <- split(tset_long, tset_long$DATE)
-#         tset_array <- array(dim = c(length(tset_list), length(unique(tset_list[[1]]$CDEC_ID))*(dim(tsetpvs)[2]+1)))
-#         for(i in seq_along(tset_list)){tset_array[i, ] <- tset_list[[i]][, 4]}
-#         return(tset_array)
-#       }
-#       
-#       trainset_array <- makearray(trainset, trainsetpvs)
-#       testset_array <- makearray(testset, testsetpvs)
-#       
-#       # split into predictor variables and response variables
-#       trainsetpv_array <- trainset_array[,1:(length(unique(trainset$CDEC_ID))*dim(trainsetpvs)[2])]
-#       trainsetrv_array <- trainset_array[,(length(unique(trainset$CDEC_ID))*dim(trainsetpvs)[2]+1):dim(trainset_array)[2]]
-#       testsetpv_array <- testset_array[,1:dim(testsetpvs)[2]]
-#       testsetrv_array <- testset_array[,dim(testsetpvs)[2]+1]
-#       
-#       nnmodel <- keras_model_sequential() %>%
-#         layer_dense(units=64, activation="relu", input_shape=c(length(unique(trainset$CDEC_ID))* dim(trainsetpvs)[2])) %>%
-#         layer_dense(units=64, activation="relu") %>%
-#         layer_dense(units=length(unique(trainset$CDEC_ID)))
-#     
-#       nnmodel %>% 
-#         compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
-# 
-#       nnmodel %>%
-#         fit(trainsetpv_array, trainsetrv_array, epochs=100, verbose=1, validation_split=0.2)
-#       
-#       predictions <- nnmodel %>% predict(testsetpv_array)
-#       predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
-#       results[[k]] <- cbind(obs=testsetrv_array[ , 1], pred=predictions)
-#       modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
-#     }
-#     names_tbd <- rownames(modgof[[1]])
-#     modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
-#     rownames(modgof) <- names_tbd
-#     colnames(modgof) <- unique(data$CDEC_ID)
-#   }
-#   
-#   if(groupingstyle=="resub"){
-#     list(results=results, gof=modgof)
-#   } else if(groupingstyle=="logo"){
-#     list(results=results, gof=modgof)
-#   } else{
-#     list(results=results, gof=modgof, kf=group)
-#   }
-# }
+nntcv <- function(data, groupingstyle){
+  if(groupingstyle=="logo"){
+    results <- modgof <- list()
+
+    for (k in 1:(length(unique(data$CDEC_ID)))){
+      data <- data[order(data$DATE), ] # order data by timeseries
+      h <- unique(data$CDEC_ID)[k]
+      testset <- data[data$CDEC_ID==h, ]
+      trainset <- data[data$CDEC_ID!=h, ]
+      testsetpvs <- as.matrix(testset[ , c(13:(ncol(testset)-1))])
+      trainsetpvs <- as.matrix(trainset[ , c(13:(ncol(trainset)-1))])
+      testsetrv <- as.matrix(testset$FLOW)
+      trainsetrv <- as.matrix(trainset$FLOW)
+
+      library(reshape2)
+      makearray <- function(tset, tsetpvs){
+        tset_long <- melt(tset, id.vars=c("CDEC_ID", "DATE"), measure.vars=c(colnames(tsetpvs), "FLOW"), variable.name="VARS", value.name="VALUE")
+        tset_list <- split(tset_long, tset_long$DATE)
+        tset_array <- array(dim = c(length(tset_list), length(unique(tset_list[[1]]$CDEC_ID))*(dim(tsetpvs)[2]+1)))
+        for(i in seq_along(tset_list)){tset_array[i, ] <- tset_list[[i]][, 4]}
+        return(tset_array)
+      }
+
+      trainset_array <- makearray(trainset, trainsetpvs)
+      testset_array <- makearray(testset, testsetpvs)
+
+      # split into predictor variables and response variables
+      trainsetpv_array <- trainset_array[,1:(length(unique(trainset$CDEC_ID))*dim(trainsetpvs)[2])]
+      trainsetrv_array <- trainset_array[,(length(unique(trainset$CDEC_ID))*dim(trainsetpvs)[2]+1):dim(trainset_array)[2]]
+      testsetpv_array <- testset_array[,1:dim(testsetpvs)[2]]
+      testsetrv_array <- testset_array[,dim(testsetpvs)[2]+1]
+
+      nnmodel <- keras_model_sequential() %>%
+        layer_dense(units=64, activation="relu", input_shape=c(length(unique(trainset$CDEC_ID))* dim(trainsetpvs)[2])) %>%
+        layer_dense(units=64, activation="relu") %>%
+        layer_dense(units=length(unique(trainset$CDEC_ID)))
+
+      nnmodel %>%
+        compile(optimizer="rmsprop", loss=keras::loss_mean_squared_error, metrics=c("mae"))
+
+      nnmodel %>%
+        fit(trainsetpv_array, trainsetrv_array, epochs=100, verbose=1, validation_split=0.2)
+
+      predictions <- nnmodel %>% predict(testsetpv_array)
+      predictions <- predictions[ , 1] # because output layer was specified to be of unit=1
+      results[[k]] <- cbind(obs=testsetrv_array[ , 1], pred=predictions)
+      modgof[[k]] <- gof(as.data.frame(results[[k]])$pred, as.data.frame(results[[k]])$obs)
+    }
+    
+    names_tbd <- rownames(modgof[[1]])
+    modgof <- data.frame(matrix(unlist(modgof), nrow=length(modgof[[1]]), byrow=FALSE))
+    rownames(modgof) <- names_tbd
+    colnames(modgof) <- unique(data$CDEC_ID)
+  }
+  
+  list(results=results, gof=modgof)
+}
 ```
-
-### 4.4.1 LSTM
-Predictor $X$ is a 3D matrix:
-1. length of the time series
-2. the lag;
-3. the number of variables used for prediction $X$ (at least 1 for the series at a given lag). Here, it's 15 * the number of basins (9) or however many is in the training set. 
-
-Response $Y$ is a 2D matrix:
-1. length of the time series
-2. the lag;
 
 # 5.0 Post Processing 
 ```{r data_results_df}
@@ -745,14 +987,25 @@ pp_results <- function(resultsls, resultsdf, modeltype, groupingstyle){
     }
   }
   
-  if(groupingstyle=="logo"){ # no need to use the unique CDEC_IDs vector to scramble the unlisted results because the original results dataframe is in the same order, so a simple cbind will be OK
+  if(groupingstyle=="logo"){ 
+    if(modeltype=="lstm"){
     results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
-    resultsdf <- cbind(resultsdf, LOGOFIT=results_unlisted$pred)
+    # resultsdf needs to get truncated by ncells at each basin
+    resultsdf_truncated <- resultsdf[resultsdf$DATE >= min(resultsdf$DATE)+ncells-1, ]
+    resultsdf <- cbind(resultsdf_truncated, LOGOFIT=results_unlisted$pred)
     resultsdf$LOGORES <- resultsdf$LOGOFIT-resultsdf$FLOW 
-    
     # adding a KF column to make it consistent between groupingstyles
     resultsdf$KF <- as.numeric(resultsdf$CDEC_ID)
     colnames(resultsdf)[ncol(resultsdf)] <- "LOGOKF"
+    } else{
+    # no need to use the unique CDEC_IDs vector to scramble the unlisted results because the original results dataframe is in the same order, so a simple cbind will be OK
+    results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+    resultsdf <- cbind(resultsdf, LOGOFIT=results_unlisted$pred)
+    resultsdf$LOGORES <- resultsdf$LOGOFIT-resultsdf$FLOW 
+    # adding a KF column to make it consistent between groupingstyles
+    resultsdf$KF <- as.numeric(resultsdf$CDEC_ID)
+    colnames(resultsdf)[ncol(resultsdf)] <- "LOGOKF"     
+    }
   }
   
   if(groupingstyle=="lmgo"){
@@ -760,6 +1013,16 @@ pp_results <- function(resultsls, resultsdf, modeltype, groupingstyle){
       results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
       results_unlisted <- results_unlisted[order(results_unlisted$nforstitch), ]
       resultsdf <- cbind(resultsdf, LMGOFIT=results_unlisted$pred)
+      resultsdf$LMGORES <- resultsdf$LMGOFIT-resultsdf$FLOW
+      resultsdf <- merge(resultsdf, resultsls$kf, by="CDEC_ID")
+      colnames(resultsdf)[ncol(resultsdf)] <- "LMGOKF"
+    } else if(modeltype=="lstm") {
+      results_unlisted <- as.data.frame(do.call("rbind", resultsls$results))
+      index <- as.numeric(row.names(results_unlisted))
+      results_unlisted <- results_unlisted[order(index), ]
+      # resultsdf needs to get truncated by ncells at each basin
+      resultsdf_truncated <- resultsdf[resultsdf$DATE >= min(resultsdf$DATE)+ncells-1, ]
+      resultsdf <- cbind(resultsdf_truncated, LMGOFIT=results_unlisted$pred)
       resultsdf$LMGORES <- resultsdf$LMGOFIT-resultsdf$FLOW
       resultsdf <- merge(resultsdf, resultsls$kf, by="CDEC_ID")
       colnames(resultsdf)[ncol(resultsdf)] <- "LMGOKF"
@@ -773,7 +1036,6 @@ pp_results <- function(resultsls, resultsdf, modeltype, groupingstyle){
       colnames(resultsdf)[ncol(resultsdf)] <- "LMGOKF"
     }
   }
-  
   # now change column names based on modeltype
   colnames(resultsdf)[ncol(resultsdf)-2] <- paste0(toupper(modeltype), "_", colnames(resultsdf)[ncol(resultsdf)-2])
   colnames(resultsdf)[ncol(resultsdf)-1] <- paste0(toupper(modeltype), "_", colnames(resultsdf)[ncol(resultsdf)-1])
@@ -805,12 +1067,16 @@ results <- pp_results(rf_10fold_results, results, "rf", 10L)
 results <- pp_results(rf_logo_results, results, "rf", "logo")
 results <- pp_results(rf_lmgo_results, results, "rf", "lmgo")
 
-results <- pp_results(nn_resub_results, results, "nn", "resub")
-results <- pp_results(nn_2fold_results, results, "nn", 2L)
-results <- pp_results(nn_5fold_results, results, "nn", 5L)
-results <- pp_results(nn_10fold_results, results, "nn", 10L)
-results <- pp_results(nn_logo_results, results, "nn", "logo")
-results <- pp_results(nn_lmgo_results, results, "nn", "lmgo")
+results <- pp_results(nns_resub_results, results, "nn", "resub")
+results <- pp_results(nns_2fold_results, results, "nn", 2L)
+results <- pp_results(nns_5fold_results, results, "nn", 5L)
+results <- pp_results(nns_10fold_results, results, "nn", 10L)
+results <- pp_results(nns_logo_results, results, "nn", "logo")
+results <- pp_results(nns_lmgo_results, results, "nn", "lmgo")
+
+# ncells <- 5
+# results <- pp_results(lstm_logo_results, results, "lstm", "logo")
+# results <- pp_results(lstm_lmgo_results, results, "lstm", "lmgo")
 ```
 
 ## 5.2 GOF Post Processing
@@ -839,26 +1105,30 @@ gof_lm_logo <- gof(results$LM_LOGOFIT, results$FLOW, na.rm=TRUE)
 gof_glm_logo <- gof(results$GLM_LOGOFIT, results$FLOW, na.rm=TRUE)
 gof_rf_logo <- gof(results$RF_LOGOFIT, results$FLOW, na.rm=TRUE)
 gof_nn_logo <- gof(results$NN_LOGOFIT, results$FLOW, na.rm=TRUE)
+# gof_lstm_logo <- gof(results$LSTM_LOGOFIT, results$FLOW, na.rm=TRUE)
 
 gof_lm_lmgo <- gof(results$LM_LMGOFIT, results$FLOW, na.rm=TRUE)
 gof_glm_lmgo <- gof(results$GLM_LMGOFIT, results$FLOW, na.rm=TRUE)
 gof_rf_lmgo <- gof(results$RF_LMGOFIT, results$FLOW, na.rm=TRUE)
 gof_nn_lmgo <- gof(results$NN_LMGOFIT, results$FLOW, na.rm=TRUE)
+# gof_lstm_lmgo <- gof(results$LSTM_LMGOFIT, results$FLOW, na.rm=TRUE)
 
 gof_lm <- cbind(gof_lm_resub, gof_lm_2fold, gof_lm_5fold, gof_lm_10fold, gof_lm_logo, gof_lm_lmgo)
 gof_glm <- cbind(gof_glm_resub, gof_glm_2fold, gof_glm_5fold, gof_glm_10fold, gof_glm_logo, gof_glm_lmgo)
 gof_rf <- cbind(gof_rf_resub, gof_rf_2fold, gof_rf_5fold, gof_rf_10fold, gof_rf_logo, gof_rf_lmgo)
 gof_nn <- cbind(gof_nn_resub, gof_nn_2fold, gof_nn_5fold, gof_nn_10fold, gof_nn_logo, gof_nn_lmgo)
+# gof_lstm <- cbind(NA, NA, NA, NA, gof_lstm_logo, gof_lstm_lmgo)
 
 colnames(gof_lm) <- c("LM_RESUB", "LM_2FOLD", "LM_5FOLD", "LM_10FOLD", "LM_LOGO", "LM_LMGO")
 colnames(gof_glm) <- c("GLM_RESUB", "GLM_2FOLD", "GLM_5FOLD", "GLM_10FOLD", "GLM_LOGO", "GLM_LMGO")
 colnames(gof_rf) <- c("RF_RESUB", "RF_2FOLD", "RF_5FOLD", "RF_10FOLD", "RF_LOGO", "RF_LMGO")
 colnames(gof_nn) <- c("NN_RESUB", "NN_2FOLD", "NN_5FOLD", "NN_10FOLD", "NN_LOGO", "NN_LMGO")
+# colnames(gof_lstm) <- c("LSTM_RESUB", "LSTM_2FOLD", "LSTM_5FOLD", "LSTM_10FOLD", "LSTM_LOGO", "LSTM_LMGO")
 
-gof_all <- as.data.frame(cbind(gof_lm, gof_glm, gof_rf, gof_nn))
+gof_all <- as.data.frame(cbind(gof_lm, gof_glm, gof_rf, gof_nn)) # gof_lstm
 
 library(Hmisc)
-var_labels <- c("LM Resub", "LM 2 Fold", "LM 5 Fold", "LM 10 Fold", "LM Logo", "LM Lmgo", "GLM Resub", "GLM 2 Fold", "GLM 5 Fold", "GLM 10 Fold", "GLM Logo", "GLM Lmgo", "RF Resub", "RF 2 Fold", "RF 5 Fold", "RF 10 Fold", "RF Logo", "RF Lmgo", "NN Resub", "NN 2 Fold", "NN 5 Fold", "NN 10 Fold", "NN Logo", "NN Lmgo") 
+var_labels <- c("LM Resub", "LM 2 Fold", "LM 5 Fold", "LM 10 Fold", "LM Logo", "LM Lmgo", "GLM Resub", "GLM 2 Fold", "GLM 5 Fold", "GLM 10 Fold", "GLM Logo", "GLM Lmgo", "RF Resub", "RF 2 Fold", "RF 5 Fold", "RF 10 Fold", "RF Logo", "RF Lmgo", "NN Resub", "NN 2 Fold", "NN 5 Fold", "NN 10 Fold", "NN Logo", "NN Lmgo") # , "LSTM Resub", "LSTM 2 Fold", "LSTM 5 Fold", "LSTM 10 Fold", "LSTM Logo", "LSTM Lmgo"
 names(var_labels) <- colnames(gof_all)
 Hmisc::label(gof_all) <- lapply(names(var_labels), function(x) Hmisc::label(gof_all[,x]) = var_labels[x])
 
@@ -875,8 +1145,8 @@ gof_lm_resub <- gof_glm_resub <- gof_rf_resub <- gof_nn_resub <- list()
 gof_lm_2fold <- gof_glm_2fold <- gof_rf_2fold <- gof_nn_2fold <- list()
 gof_lm_5fold <- gof_glm_5fold <- gof_rf_5fold <- gof_nn_5fold <- list()
 gof_lm_10fold <- gof_glm_10fold <- gof_rf_10fold <- gof_nn_10fold <- list()
-gof_lm_logo <- gof_glm_logo <- gof_rf_logo <- gof_nn_logo <- list()
-gof_lm_lmgo <- gof_glm_lmgo <- gof_rf_lmgo <- gof_nn_lmgo <- list()
+gof_lm_logo <- gof_glm_logo <- gof_rf_logo <- gof_nn_logo  <-  list() # gof_lstm_logo
+gof_lm_lmgo <- gof_glm_lmgo <- gof_rf_lmgo <- gof_nn_lmgo <- list() # gof_lstm_lmgo 
 
 for (r in 1:(length(unique(results$CDEC_ID)))){ 
   h <- unique(results$CDEC_ID)[r]
@@ -906,11 +1176,13 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
   gof_glm_logo[[r]] <- gof(resultsdf_sub$GLM_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
   gof_rf_logo[[r]] <- gof(resultsdf_sub$RF_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
   gof_nn_logo[[r]] <- gof(resultsdf_sub$NN_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  # gof_lstm_logo[[r]] <- gof(resultsdf_sub$LSTM_LOGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
   
   gof_lm_lmgo[[r]] <- gof(resultsdf_sub$LM_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
   gof_glm_lmgo[[r]] <- gof(resultsdf_sub$GLM_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
   gof_rf_lmgo[[r]] <- gof(resultsdf_sub$RF_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
   gof_nn_lmgo[[r]] <- gof(resultsdf_sub$NN_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
+  # gof_lstm_lmgo[[r]] <- gof(resultsdf_sub$LSTM_LMGOFIT, resultsdf_sub$FLOW, na.rm=TRUE)
 }
 
 names_tbd <- rownames(gof_lm_resub[[1]])
@@ -934,14 +1206,16 @@ gof_lm_logo_by_basins <- data.frame(matrix(unlist(gof_lm_logo), nrow=length(gof_
 gof_glm_logo_by_basins <- data.frame(matrix(unlist(gof_glm_logo), nrow=length(gof_glm_logo[[1]]), byrow=FALSE))
 gof_rf_logo_by_basins <- data.frame(matrix(unlist(gof_rf_logo), nrow=length(gof_rf_logo[[1]]), byrow=FALSE))
 gof_nn_logo_by_basins <- data.frame(matrix(unlist(gof_nn_logo), nrow=length(gof_nn_logo[[1]]), byrow=FALSE))
+# gof_lstm_logo_by_basins <- data.frame(matrix(unlist(gof_lstm_logo), nrow=length(gof_lstm_logo[[1]]), byrow=FALSE))
 gof_lm_lmgo_by_basins <- data.frame(matrix(unlist(gof_lm_lmgo), nrow=length(gof_lm_lmgo[[1]]), byrow=FALSE))
 gof_glm_lmgo_by_basins <- data.frame(matrix(unlist(gof_glm_lmgo), nrow=length(gof_glm_lmgo[[1]]), byrow=FALSE))
 gof_rf_lmgo_by_basins <- data.frame(matrix(unlist(gof_rf_lmgo), nrow=length(gof_rf_lmgo[[1]]), byrow=FALSE))
 gof_nn_lmgo_by_basins <- data.frame(matrix(unlist(gof_nn_lmgo), nrow=length(gof_nn_lmgo[[1]]), byrow=FALSE))
+# gof_lstm_lmgo_by_basins <- data.frame(matrix(unlist(gof_lstm_lmgo), nrow=length(gof_lstm_lmgo[[1]]), byrow=FALSE))
 
-rownames(gof_lm_resub_by_basins) <- rownames(gof_glm_resub_by_basins) <- rownames(gof_rf_resub_by_basins) <- rownames(gof_nn_resub_by_basins) <- rownames(gof_lm_2fold_by_basins) <- rownames(gof_glm_2fold_by_basins) <- rownames(gof_rf_2fold_by_basins) <- rownames(gof_nn_2fold_by_basins) <- rownames(gof_lm_5fold_by_basins) <- rownames(gof_glm_5fold_by_basins) <- rownames(gof_rf_5fold_by_basins) <- rownames(gof_nn_5fold_by_basins) <- rownames(gof_lm_10fold_by_basins) <- rownames(gof_glm_10fold_by_basins) <- rownames(gof_rf_10fold_by_basins) <- rownames(gof_nn_10fold_by_basins) <- rownames(gof_lm_logo_by_basins) <- rownames(gof_glm_logo_by_basins) <- rownames(gof_rf_logo_by_basins) <- rownames(gof_nn_logo_by_basins) <- rownames(gof_lm_lmgo_by_basins) <- rownames(gof_glm_lmgo_by_basins) <- rownames(gof_rf_lmgo_by_basins) <- rownames(gof_nn_lmgo_by_basins) <- names_tbd
+rownames(gof_lm_resub_by_basins) <- rownames(gof_glm_resub_by_basins) <- rownames(gof_rf_resub_by_basins) <- rownames(gof_nn_resub_by_basins) <- rownames(gof_lm_2fold_by_basins) <- rownames(gof_glm_2fold_by_basins) <- rownames(gof_rf_2fold_by_basins) <- rownames(gof_nn_2fold_by_basins) <- rownames(gof_lm_5fold_by_basins) <- rownames(gof_glm_5fold_by_basins) <- rownames(gof_rf_5fold_by_basins) <- rownames(gof_nn_5fold_by_basins) <- rownames(gof_lm_10fold_by_basins) <- rownames(gof_glm_10fold_by_basins) <- rownames(gof_rf_10fold_by_basins) <- rownames(gof_nn_10fold_by_basins) <- rownames(gof_lm_logo_by_basins) <- rownames(gof_glm_logo_by_basins) <- rownames(gof_rf_logo_by_basins) <- rownames(gof_nn_logo_by_basins) <- rownames(gof_lm_lmgo_by_basins) <- rownames(gof_glm_lmgo_by_basins) <- rownames(gof_rf_lmgo_by_basins) <- rownames(gof_nn_lmgo_by_basins) <- names_tbd # rownames(gof_lstm_lmgo_by_basins) rownames(gof_lstm_logo_by_basins)
   
-colnames(gof_lm_resub_by_basins) <- colnames(gof_glm_resub_by_basins) <- colnames(gof_rf_resub_by_basins) <- colnames(gof_nn_resub_by_basins) <- colnames(gof_lm_2fold_by_basins) <- colnames(gof_glm_2fold_by_basins) <- colnames(gof_rf_2fold_by_basins) <- colnames(gof_nn_2fold_by_basins) <- colnames(gof_lm_5fold_by_basins) <- colnames(gof_glm_5fold_by_basins) <- colnames(gof_rf_5fold_by_basins) <- colnames(gof_nn_5fold_by_basins) <- colnames(gof_lm_10fold_by_basins) <- colnames(gof_glm_10fold_by_basins) <- colnames(gof_rf_10fold_by_basins) <- colnames(gof_nn_10fold_by_basins) <- colnames(gof_lm_logo_by_basins) <- colnames(gof_glm_logo_by_basins) <- colnames(gof_rf_logo_by_basins) <- colnames(gof_nn_logo_by_basins) <- colnames(gof_lm_lmgo_by_basins) <- colnames(gof_glm_lmgo_by_basins) <- colnames(gof_rf_lmgo_by_basins) <- colnames(gof_nn_lmgo_by_basins) <- unique(results$CDEC_ID)
+colnames(gof_lm_resub_by_basins) <- colnames(gof_glm_resub_by_basins) <- colnames(gof_rf_resub_by_basins) <- colnames(gof_nn_resub_by_basins) <- colnames(gof_lm_2fold_by_basins) <- colnames(gof_glm_2fold_by_basins) <- colnames(gof_rf_2fold_by_basins) <- colnames(gof_nn_2fold_by_basins) <- colnames(gof_lm_5fold_by_basins) <- colnames(gof_glm_5fold_by_basins) <- colnames(gof_rf_5fold_by_basins) <- colnames(gof_nn_5fold_by_basins) <- colnames(gof_lm_10fold_by_basins) <- colnames(gof_glm_10fold_by_basins) <- colnames(gof_rf_10fold_by_basins) <- colnames(gof_nn_10fold_by_basins) <- colnames(gof_lm_logo_by_basins) <- colnames(gof_glm_logo_by_basins) <- colnames(gof_rf_logo_by_basins) <- colnames(gof_nn_logo_by_basins) <- colnames(gof_lm_lmgo_by_basins) <- colnames(gof_glm_lmgo_by_basins) <- colnames(gof_rf_lmgo_by_basins) <- colnames(gof_nn_lmgo_by_basins) <- unique(results$CDEC_ID) # colnames(gof_lstm_logo_by_basins)  colnames(gof_lstm_lmgo_by_basins)
   
 remove(names_tbd)
 ```
@@ -952,9 +1226,10 @@ remove(names_tbd)
 ```{r mof_comp_plots}
 # CV plot, just for bR2
 goftablet <- data.frame(t(gof_all))
-goftablet$MODELTYPE <- factor(c("LM", "LM", "LM", "LM", "LM", "LM", "GLM", "GLM", "GLM", "GLM", "GLM", "GLM", "RF", "RF", "RF", "RF", "RF", "RF", "NN", "NN", "NN", "NN", "NN", "NN"), levels= c("LM", "GLM", "RF", "NN"))
+goftablet$MODELTYPE <- factor(c(rep("LM", 6), rep("GLM", 6), rep("RF", 6), rep("NN", 6)), levels= c("LM", "GLM", "RF", "NN")) # , rep("LSTM", 6) levels= "LSTM"
 goftablet$CVTYPE <- rep(c("RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO"), times=4)
-goftablet$COLORS <- c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])[goftablet$MODELTYPE]
+goftablet$COLORS <- c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[8])[goftablet$MODELTYPE]
+goftablet <- na.omit(goftablet)
 
 png('Output Data/rplot41_gof_bR2.png', width=6.5, height=4, units="in", pointsize=8, res=1200)
   plottoprint <- ggplot(goftablet)+
@@ -962,65 +1237,26 @@ png('Output Data/rplot41_gof_bR2.png', width=6.5, height=4, units="in", pointsiz
     geom_point(aes(x = bR2, y = reorder(rownames(goftablet), bR2), color=MODELTYPE, shape=CVTYPE))+
     scale_y_discrete(labels=var_labels[match(rownames(goftablet), names(var_labels))])+
     theme_bw(base_size = 8) +
-    annotate("rect", xmin = 0.2, xmax = 0.5, ymin = 1, ymax = 24, fill= "grey55", alpha = 0.5) +
+    annotate("rect", xmin = 0, xmax = 0.5, ymin = 1, ymax = 24, fill= "grey55", alpha = 0.5) +
     annotate("rect", xmin = 0.5, xmax = 0.65, ymin = 1, ymax = 24, fill= "grey70", alpha = 0.5) +
     annotate("rect", xmin = 0.65, xmax = 0.75, ymin = 1, ymax = 24, fill= "grey85", alpha = 0.5) +
     annotate("rect", xmin = 0.75, xmax = 1.0, ymin = 1, ymax = 24, fill= "grey95", alpha = 0.5) +
     geom_text(aes(x = bR2, y = reorder(rownames(goftablet), bR2), label=bR2), nudge_x = 0.03, size=3) +
-    geom_text(aes(x= 0.35, y=24, label="Unsatisfactory"), size=3, hjust="center")+
+    geom_text(aes(x= 0.25, y=24, label="Unsatisfactory"), size=3, hjust="center")+
     geom_text(aes(x= 0.575, y=24, label="Satisfactory"), size=3, hjust="center")+
     geom_text(aes(x= 0.7, y=1, label="Good"), size=3, hjust="center")+
     geom_text(aes(x= 0.875, y=1, label="Very Good"), size=3, hjust="center")+
     ylab("") +
     xlab("Bias-Corrected Coefficient of Determination (-)") +
-    theme(legend.title = element_blank(), legend.text=element_text(size=10), text=element_text(size=10), legend.position = "right", legend.box = "vertical", axis.text.y = element_text(colour=goftablet[order(goftablet$bR2),]$COLOR))+
-    scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])) +  
+    theme(legend.title = element_blank(), legend.text=element_text(size=10), text=element_text(size=10), legend.position = "right", legend.box = "vertical", axis.text.y = element_text(color=goftablet[order(goftablet$bR2),]$COLORS))+
+    scale_colour_manual(aesthetics = c("color"), values=c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[8])) +  
     scale_shape_manual(breaks = c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"), values=c(2, 8, 5, 15, 16, 4)) + # to order the legend
     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
   print(plottoprint)
 dev.off()
-
-# try putting a bracket around NN and RF and call them out, not doing this just yet
-# library(grid)
-# library(pBrackets) 
-# 
-# png('Output Data/rplot41_gof_bR2.png', width=6.5, height=4, units="in", pointsize=8, res=1200)
-# plottoprint
-# grid.locator(unit="native") 
-# grid.brackets(2200, 28,   2300, 28, lwd=2, col="red")
-# dev.off()
-
-# # BS plot, just for bR2
-# goftablet_bs <- data.frame(t(gof_all_bs))
-# goftablet_bs$MODELTYPE <- factor(c("LM", "LM", "LM", "GLM", "GLM", "GLM", "RF", "RF", "RF", "NN", "NN", "NN"), levels= c("LM", "GLM", "RF", "NN"))
-# goftablet_bs$BSTYPE <- rep(c("IID", "BBG", "BBMG"), times=4)
-# goftablet_bs$COLORS <- c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])[goftablet_bs$MODELTYPE]
-# 
-# png('Output Data/rplot41_gof_bR2_bs.png', width=6.5, height=2, units="in", pointsize=8, res=1200)
-#   ggplot(goftablet_bs)+
-#     geom_point(aes(x = bR2, y = reorder(rownames(goftablet_bs), bR2), color=MODELTYPE, shape=BSTYPE))+
-#     scale_y_discrete(labels=var_labels_bs[match(rownames(goftablet_bs), names(var_labels_bs))])+
-#     theme_bw(base_size = 8) +
-#     annotate("rect", xmin = 0.2, xmax = 0.5, ymin = 1, ymax = 12, fill= "grey55", alpha = 0.5) +
-#     annotate("rect", xmin = 0.5, xmax = 0.65, ymin = 1, ymax = 12, fill= "grey70", alpha = 0.5) +
-#     annotate("rect", xmin = 0.65, xmax = 0.75, ymin = 1, ymax = 12, fill= "grey85", alpha = 0.5) +
-#     annotate("rect", xmin = 0.75, xmax = 1.0, ymin = 1, ymax = 12, fill= "grey95", alpha = 0.5) +
-#     geom_text(aes(x = bR2, y = reorder(rownames(goftablet_bs), bR2), label=round(bR2, digits=2)), nudge_x = 0.03, size=3)+
-#     geom_text(aes(x= 0.35, y=12, label="Unsatisfactory"), size=3, hjust="center")+
-#     geom_text(aes(x= 0.575, y=12, label="Satisfactory"), size=3, hjust="center")+
-#     geom_text(aes(x= 0.7, y=1, label="Good"), size=3, hjust="center")+
-#     geom_text(aes(x= 0.875, y=1, label="Very Good"), size=3, hjust="center")+
-#     ylab("") +
-#     xlab("Bias-Corrected Coefficient of Determination (-)") +
-#     theme(legend.title = element_blank(), legend.text=element_text(size=10), text=element_text(size=10), legend.position = "right", legend.box = "vertical", axis.text.y = element_text(colour=goftablet_bs[order(goftablet_bs$bR2),]$COLOR))+
-#     scale_colour_manual(aesthetics = c("colour"), values=c(cbpblack[2], cbpblack[3], cbpblack[5], cbpblack[6])) +
-#     scale_shape_manual(breaks = c("IID", "BBG", "BBMG"), values=c(16, 2, 4)) + # to order the legend
-#     guides(colour = guide_legend(ncol=1), shape = guide_legend(ncol=1))
-# dev.off()
 ```
 
 ```{r mof_comp_ggplots} 
-# for CV
 png('Output Data/rplot42_gof_bR2.png', width=6.5, height=2, units="in", pointsize=8, res=1200)
   plottoprint <- ggplot(goftablet, aes(x=MODELTYPE, y=bR2, fill=CVTYPE))+
     geom_point(aes(group=MODELTYPE, col=CVTYPE),position=position_jitterdodge(jitter.width = 0.25, jitter.height = 0, dodge.width = 0.85, seed = NA), alpha=0.8, show.legend=TRUE) +
@@ -1036,22 +1272,24 @@ dev.off()
 
 ## 6.2 Observed vs. Predicted 
 ```{r obsvspred_forpaper_ggplot}
-# to replace the base plots above
 library(reshape2)
 mastercv_lm <- results[,c("CDEC_ID", "FLOW", "LM_RESUBFIT", "LM_2FOLDFIT", "LM_5FOLDFIT", "LM_10FOLDFIT", "LM_LOGOFIT", "LM_LMGOFIT")]
 mastercv_glm <- results[,c ("CDEC_ID", "FLOW", "GLM_RESUBFIT", "GLM_2FOLDFIT", "GLM_5FOLDFIT", "GLM_10FOLDFIT", "GLM_LOGOFIT", "GLM_LMGOFIT")]
 mastercv_rf <- results[,c("CDEC_ID","FLOW", "RF_RESUBFIT", "RF_2FOLDFIT", "RF_5FOLDFIT", "RF_10FOLDFIT", "RF_LOGOFIT", "RF_LMGOFIT")]
 mastercv_nn <- results[,c("CDEC_ID", "FLOW", "NN_RESUBFIT", "NN_2FOLDFIT", "NN_5FOLDFIT", "NN_10FOLDFIT", "NN_LOGOFIT", "NN_LMGOFIT")]
+# mastercv_lstm <- results[,c("CDEC_ID", "FLOW", "LSTM_LOGOFIT", "LSTM_LMGOFIT")]
 
 mastercv_lm$MODELTYPE <- "LM"
 mastercv_glm$MODELTYPE <- "GLM"
 mastercv_rf$MODELTYPE <- "RF"
 mastercv_nn$MODELTYPE <- "NN"
+# mastercv_lstm$MODELTYPE <- "LSTM"
 
 colnames(mastercv_lm)[1:8] <- colnames(mastercv_glm)[1:8] <- colnames(mastercv_rf)[1:8] <- colnames(mastercv_nn)[1:8] <- c("CDEC_ID", "OBS", "RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO")
+# colnames(mastercv_lstm) <- c("CDEC_ID", "OBS", "LOGO", "LMGO", "MODELTYPE") 
 
 # just do NN for now, so don't join
-# master_cv <- rbind(mastercv_lm, mastercv_glm, mastercv_rf, mastercv_nn)
+# master_cv <- rbind(mastercv_lm, mastercv_glm, mastercv_rf, mastercv_nn, mastercv_lstm)
 master_cv_melted <- melt(mastercv_nn, measure.vars= c("RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO"), variable.name="GROUPINGSTYLE", value.name="PRED")
 master_cv_melted$MODELTYPE <- factor(master_cv_melted$MODELTYPE, levels=c("LM", "GLM", "RF", "NN"))
 master_cv_melted$GROUPINGSTYLE <- factor(master_cv_melted$GROUPINGSTYLE, levels=c("RESUB", "10FOLD", "5FOLD", "2FOLD", "LOGO", "LMGO"))
@@ -1076,6 +1314,31 @@ png('Output Data/rplot43_obsvspred_all_nn.png', width=6.5, height=8, units="in",
     theme_bw(base_size = 8)
   print(plottoprint)
 dev.off()
+
+# # just do logo and lmgo for nn and lstm 
+# master_cv <- rbind(mastercv_nn[, c("CDEC_ID", "OBS", "LOGO", "LMGO", "MODELTYPE")], mastercv_lstm)
+# master_cv_melted <- melt(master_cv, measure.vars= c("LOGO", "LMGO"), variable.name="GROUPINGSTYLE", value.name="PRED")
+# master_cv_melted$MODELTYPE <- factor(master_cv_melted$MODELTYPE, levels=c("NN", "LSTM"))
+# master_cv_melted$GROUPINGSTYLE <- factor(master_cv_melted$GROUPINGSTYLE, levels=c("LOGO", "LMGO"))
+# pretty_facet_labels <- c("Leave One Group Out (LOGO)", "Leave Multiple Groups Out (LMGO)")
+# names(pretty_facet_labels) <- c("LOGO", "LMGO")
+# 
+# png('Output Data/rplot43_obsvspred_logolmgo.png', width=6.5, height=6.5, units="in", pointsize=8, res=1200)
+#   plottoprint <- ggplot(master_cv_melted, aes(x=OBS, y=PRED)) +
+#     geom_point(aes(group=CDEC_ID, colour=CDEC_ID, shape=CDEC_ID)) +
+#     geom_smooth(method="lm", se=FALSE, color="black")+
+#     stat_poly_eq(formula = y ~ x, 
+#                 aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+#                 parse = TRUE) +
+#     geom_abline(slope=1, intercept=0, color="black", linetype=3)+
+#     facet_wrap(~GROUPINGSTYLE+MODELTYPE, ncol=2, labeller=labeller(GROUPINGSTYLE=pretty_facet_labels))+
+#     scale_discrete_manual(aesthetics = "color", values=cbpblack, name="Basin")+
+#     scale_discrete_manual(aesthetics= "shape", values=c(1:19), name="Basin") +
+#     labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
+#     theme(legend.text=element_text(size=10), text=element_text(size=10))+
+#     theme_bw(base_size = 8)
+#   print(plottoprint)
+# dev.off()
 ```
 
 ## 6.3 Density Plots
@@ -1084,6 +1347,7 @@ mastercv_lm <- results[,c("FLOW", "LM_RESUBFIT", "LM_2FOLDFIT", "LM_5FOLDFIT", "
 mastercv_glm <- results[,c("FLOW", "GLM_RESUBFIT", "GLM_2FOLDFIT", "GLM_5FOLDFIT", "GLM_10FOLDFIT", "GLM_LOGOFIT", "GLM_LMGOFIT")]
 mastercv_rf <- results[,c("FLOW", "RF_RESUBFIT", "RF_2FOLDFIT", "RF_5FOLDFIT", "RF_10FOLDFIT", "RF_LOGOFIT", "RF_LMGOFIT")]
 mastercv_nn <- results[,c("FLOW", "NN_RESUBFIT", "NN_2FOLDFIT", "NN_5FOLDFIT", "NN_10FOLDFIT", "NN_LOGOFIT", "NN_LMGOFIT")]
+# mastercv_lstm <- results[,c("FLOW", "LSTM_LOGOFIT", "LSTM_LMGOFIT")]
 
 mastercv_lm$MODELTYPE <- "LM"
 mastercv_glm$MODELTYPE <- "GLM"
@@ -1120,7 +1384,7 @@ dev.off()
 
 ## 6.4 Map Plots
 ```{r error_mapplots}
-# modeltype can be: "lm", "glm", "rf", "nn"
+# modeltype can be: "lm", "glm", "rf", "nn", "lstm"
 library(RColorBrewer)
 library(lattice)
 library(grid)
@@ -1161,6 +1425,7 @@ br2map <- function(gof_results, modelform, groupingstyle, datatype){
 # br2map(gof_nn_10fold_by_basins, "nn", "10fold", "agg")
 br2map(gof_nn_logo_by_basins, "nn", "logo", "agg")
 # br2map(gof_nn_lmgo_by_basins, "nn", "lmgo", "agg")
+# br2map(gof_lstm_logo_by_basins, "lstm", "logo", "agg")
 ```
 
 ## 6.5 Dotcharts
@@ -1304,10 +1569,11 @@ gofdotchart <- function(gof_results_resub, gof_results_2fold, gof_results_5fold,
   dev.off()
 }
 
-gofdotchart(gof_lm_resub_by_basins, gof_lm_2fold_by_basins, gof_lm_5fold_by_basins, gof_lm_10fold_by_basins, gof_lm_logo_by_basins, gof_lm_lmgo_by_basins, "lm", "bR2")
-gofdotchart(gof_glm_resub_by_basins, gof_glm_2fold_by_basins, gof_glm_5fold_by_basins, gof_glm_10fold_by_basins, gof_glm_logo_by_basins, gof_glm_lmgo_by_basins, "glm", "bR2")
-gofdotchart(gof_rf_resub_by_basins, gof_rf_2fold_by_basins, gof_rf_5fold_by_basins, gof_rf_10fold_by_basins, gof_rf_logo_by_basins, gof_rf_lmgo_by_basins, "rf", "bR2")
+# gofdotchart(gof_lm_resub_by_basins, gof_lm_2fold_by_basins, gof_lm_5fold_by_basins, gof_lm_10fold_by_basins, gof_lm_logo_by_basins, gof_lm_lmgo_by_basins, "lm", "bR2")
+# gofdotchart(gof_glm_resub_by_basins, gof_glm_2fold_by_basins, gof_glm_5fold_by_basins, gof_glm_10fold_by_basins, gof_glm_logo_by_basins, gof_glm_lmgo_by_basins, "glm", "bR2")
+# gofdotchart(gof_rf_resub_by_basins, gof_rf_2fold_by_basins, gof_rf_5fold_by_basins, gof_rf_10fold_by_basins, gof_rf_logo_by_basins, gof_rf_lmgo_by_basins, "rf", "bR2")
 gofdotchart(gof_nn_resub_by_basins, gof_nn_2fold_by_basins, gof_nn_5fold_by_basins, gof_nn_10fold_by_basins, gof_nn_logo_by_basins, gof_nn_lmgo_by_basins, "nn", "bR2")
+# gofdotchart(gof_nn_resub_by_basins, gof_nn_2fold_by_basins, gof_nn_5fold_by_basins, gof_nn_10fold_by_basins, gof_lstm_logo_by_basins, gof_lstm_lmgo_by_basins, "lstm", "bR2")
 ```
 
 ## 6.6 Boxplots
@@ -1365,6 +1631,7 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
     # plot your discharge data
     geom_line() +
     scale_colour_manual("", values = c(cbpblack[1:5]), labels=c("Obs", "LM", "GLM", "RF", "NN")) +
+    theme_bw()+
     theme(legend.position="bottom", legend.title = element_blank()) +
   
     # create a second axis with sec_axis() and format the labels to display the original precipitation units
@@ -1430,6 +1697,7 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
     # plot your discharge data
     geom_line() +
     scale_colour_manual("", values = c(cbpblack[1:5]), labels=c("Obs", "LM", "GLM", "RF", "NN")) +
+    theme_bw()+
     theme(legend.position="bottom", legend.title = element_blank()) +
   
     # create a second axis with sec_axis() and format the labels to display the original precipitation units
@@ -1440,5 +1708,455 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
   print(hydrograph)
   dev.off()
 }
+```
+
+## 6.8 Variable Importance Plots 
+```{r vip_prep}
+# the models need to be saved, so run the modeling again
+
+# # NN
+# nfeat <- dim(moddf[,c(10,13:(ncol(moddf)-1))])[2]
+# 
+# # define the model
+# nnmodel <- keras_model_sequential() %>%
+#   layer_dense(units=64, activation="tanh", input_shape=nfeat) %>%
+#   layer_dense(units=64, activation="exponential") %>%
+#   layer_dense(units=1)
+# 
+# # compile 
+# nnmodel %>%
+#   compile(optimizer=optimizer_adam(clipnorm = TRUE, clipvalue = 1), loss=loss_mean_squared_error, metrics=c("mae"))
+# 
+# # define a callback for early stopping
+# callbacks <- list(callback_early_stopping(patience=10, mode="min", restore_best_weights=TRUE)) 
+# 
+# for (k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+#   testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+#   trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+#   testsetrv <- as.matrix(testset$FLOW)
+#   trainsetrv <- as.matrix(trainset$FLOW)
+#   
+#   # mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)!
+#   trainmean <- apply(trainsetpvs, 2, mean)
+#   trainsd <- apply(trainsetpvs, 2, sd)
+#   trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/") 
+#   testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+#   
+#   nnmodel %>%
+#     fit(trainsetpvs, trainsetrv, epochs=100, batch_size=32, verbose=1, validation_split=0.2, callbacks=callbacks)
+#   
+#   nnmodel %>% save_model_hdf5(paste0("Output Data/vi_models/nn_hdf5/nn_", h, ".h5"))
+# }
+
+# # LM
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+#   lmmodel <- lm(FLOW~., data=trainset[,c(10,13:ncol(trainset))])
+#   saveRDS(lmmodel, paste0("Output Data/vi_models/lm_rds/lm_", h, ".rds"))
+# }
+
+# # GLM
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+#   glmmodel <- glm(FLOW~., data=trainset[,c(10,13:ncol(trainset))], family=tweedie(var.power=1.1, link.power=0), maxit=1000)
+#   saveRDS(glmmodel, paste0("Output Data/vi_models/glm_rds/glm_", h, ".rds"))
+# }
+
+# # RF
+# memory.limit()
+# memory.limit(100000) # set memory limit large 10GB
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+#   rfmodel <- randomForest(FLOW~., data=trainset[,c(10,13:ncol(trainset))], mtry=20)
+#   saveRDS(rfmodel, paste0("Output Data/vi_models/rf_rds/rf_", h, ".rds"))
+# }
+
+# read back in
+memory.limit(100000) # set memory limit large for rfmodel
+linearmodel <- glinearmodel <- rfmodel <- list()
+for(k in 1:(length(unique(moddf$CDEC_ID)))){
+  linearmodel[[k]] <- readRDS(paste0("Output Data/vi_models/lm_rds/lm_", h, ".rds"))
+  glinearmodel[[k]] <- readRDS(paste0("Output Data/vi_models/glm_rds/glm_", h, ".rds"))
+  rfmodel[[k]] <- readRDS(paste0("Output Data/vi_models/rf_rds/rf_", h, ".rds"))
+}
+```
+
+```{r vip} 
+library(vip)
+library(ggplot2)
+
+## NN
+pred_wrapper <- function(object, newdata) {
+  predict(object, x = as.matrix(newdata)) %>%
+  as.vector()
+}
+
+nnvip <- list()
+nnmodel <- list()
+nfeat <- dim(moddf[,c(10,13:(ncol(moddf)-1))])[2]
+
+for(k in 1:(length(unique(moddf$CDEC_ID)))){
+  h <- unique(moddf$CDEC_ID)[k]
+  testset <- moddf[moddf$CDEC_ID==h,]
+  trainset <- moddf[moddf$CDEC_ID!=h,]
+  testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+  trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+  testsetrv <- as.matrix(testset$FLOW)
+  trainsetrv <- as.matrix(trainset$FLOW)
+
+  # mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)!
+  trainmean <- apply(trainsetpvs, 2, mean)
+  trainsd <- apply(trainsetpvs, 2, sd)
+  trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+  testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+  
+  modfilename <- paste0("Output Data/vi_models/nn_hdf5/nn_", h, ".h5")
+  nnmodel[[k]] <- load_model_hdf5(modfilename, compile=FALSE)
+
+  nnvip[[k]] <- vip(
+    object = nnmodel[[k]],                                     # fitted model
+    method = "permute",                                        # permutation-based VI scores
+    num_features = nfeat,                                      # default only plots top 10 features
+    pred_wrapper = pred_wrapper(nnmodel[[k]], testsetpvs),     # user-defined prediction function
+    train = as.data.frame(trainsetpvs),                        # training data
+    target = trainsetrv,                                       # response values used for training
+    metric = "rsquared",                                       # evaluation metric
+    # progress = "text"                                        # request a text-based progress bar
+    )
+}
+
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   png(paste0("Output Data/vip/nn/vip_testset_", h, ".png"), width=6.5, height=8, units="in", pointsize=8, res=1200)
+#     print(nnvip[[k]], bar=FALSE, shape=19, horizontal=TRUE) + theme_bw()
+#   dev.off()
+# }
+
+# LM
+lmvip <- list()
+for(k in 1:(length(unique(moddf$CDEC_ID)))){
+  h <- unique(moddf$CDEC_ID)[k]
+  testset <- moddf[moddf$CDEC_ID==h,]
+  trainset <- moddf[moddf$CDEC_ID!=h,]
+  testsetpvs <- testset[,c(10,13:(ncol(testset)-1))]
+  trainsetpvs <- trainset[,c(10,13:(ncol(trainset)-1))]
+  testsetrv <- testset$FLOW
+  trainsetrv <- trainset$FLOW
+  
+  lmvip[[k]] <- vip(
+    object = linearmodel[[k]],                                  # fitted model
+    method = "model",                                           # model-based VI scores, vip recognizes some model types
+    num_features = nfeat,                                       # default only plots top 10 features
+    pred_wrapper = pred_wrapper(linearmodel[[k]], testsetpvs),  # user-defined prediction function
+    train = as.data.frame(trainsetpvs),                         # training data
+    target = trainsetrv,                                        # response values used for training
+    metric = "r2",                                              # evaluation metric
+    task = "regression"
+    # progress = "text"                                         # request a text-based progress bar
+    )
+}
+
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   png(paste0("Output Data/vip/lm/vip_testset_", h, ".png"), width=6.5, height=8, units="in", pointsize=8, res=1200)
+#     print(lmvip[[k]], bar=FALSE, shape=19, horizontal=TRUE) + theme_bw()
+#   dev.off()
+# }
+
+# GLM
+glmvip <- list()
+for(k in 1:(length(unique(moddf$CDEC_ID)))){
+  h <- unique(moddf$CDEC_ID)[k]
+  testset <- moddf[moddf$CDEC_ID==h,]
+  trainset <- moddf[moddf$CDEC_ID!=h,]
+  testsetpvs <- testset[,c(10,13:(ncol(testset)-1))]
+  trainsetpvs <- trainset[,c(10,13:(ncol(trainset)-1))]
+  testsetrv <- testset$FLOW
+  trainsetrv <- trainset$FLOW
+  
+  glmvip[[k]] <- vip(
+    object = glinearmodel[[k]],                                     # fitted model
+    method = "model",                                               # model-based VI scores, vip recognizes some model types
+    num_features = nfeat,                                           # default only plots top 10 features
+    pred_wrapper = pred_wrapper(glinearmodel[[k]], testsetpvs),     # user-defined prediction function
+    train = as.data.frame(trainsetpvs),                             # training data
+    target = trainsetrv,                                            # response values used for training
+    metric = "r2",                                                  # evaluation metric
+    task = "regression"
+    # progress = "text"                                             # request a text-based progress bar
+    )
+}
+
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   png(paste0("Output Data/vip/glm/vip_testset_", h, ".png"), width=6.5, height=8, units="in", pointsize=8, res=1200)
+#     print(glmvip[[k]], bar=FALSE, shape=19, horizontal=TRUE) + theme_bw()
+#   dev.off()
+# }
+
+# RF 
+rfvip <- list()
+rfmodel <- list()
+for(k in 1:(length(unique(moddf$CDEC_ID)))){
+  h <- unique(moddf$CDEC_ID)[k]
+  testset <- moddf[moddf$CDEC_ID==h,]
+  trainset <- moddf[moddf$CDEC_ID!=h,]
+  testsetpvs <- testset[,c(10,13:(ncol(testset)-1))]
+  trainsetpvs <- trainset[,c(10,13:(ncol(trainset)-1))]
+  testsetrv <- testset$FLOW
+  trainsetrv <- trainset$FLOW
+  
+  modfilename <- paste0("Output Data/vi_models/rf_rds/rf_", h, ".rds")
+  rfmodel[[k]] <- readRDS(modfilename)
+  
+  rfvip[[k]] <- vip(
+    object = rfmodel[[k]],                                               # fitted model
+    method = "model",                                                    # model-based VI scores
+    num_features = nfeat,                                                # default only plots top 10 features
+    pred_wrapper = pred_wrapper(rfmodel[[k]], testsetpvs),               # user-defined prediction function
+    train = as.data.frame(trainsetpvs),                                  # training data
+    target = trainsetrv,                                                 # response values used for training
+    metric = "r2",                                                       # evaluation metric
+    task = "regression"
+    # progress = "text"                                                  # request a text-based progress bar
+    )
+}
+
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   png(paste0("Output Data/vip/rf/vip_testset_", h, ".png"), width=6.5, height=8, units="in", pointsize=8, res=1200)
+#     print(rfvip[[k]], bar=FALSE, shape=19, horizontal=TRUE) + theme_bw()
+#   dev.off()
+# }
+```
+
+```{r vip_averages} 
+vimeans <- function(model, ...){
+  vils <- list()
+  for(k in 1:(length(unique(moddf$CDEC_ID)))){
+    h <- unique(moddf$CDEC_ID)[k]
+    vils[[k]] <- data.frame(vi(model[[k]], var_fun="con", scale=TRUE, ...))
+    vils[[k]][,"TESTSET"] <- h
+  }
+  vidf <- do.call("rbind", vils)
+  vidf_mean <- aggregate(Importance~Variable, data=vidf, FUN=mean)
+  vidf_mean <- vidf_mean[order(vidf_mean$Importance, decreasing=TRUE), ]
+}
+
+lmvi_mean <- vimeans(linearmodel, method="model")
+lmvi_mean$MODELTYPE <- "LM"
+
+glmvi_mean <- vimeans(glinearmodel, method="model")
+glmvi_mean$MODELTYPE <- "GLM"
+
+rfvi_mean <- vimeans(rfmodel, method="model")
+rfvi_mean$MODELTYPE <- "RF"
+
+# have to treat this specially
+vils <- list()
+for(k in 1:(length(unique(moddf$CDEC_ID)))){
+  h <- unique(moddf$CDEC_ID)[k]
+  vils[[k]] <- data.frame(nnvip[[k]]$data)
+  vils[[k]][,"TESTSET"] <- h
+}
+vidf <- do.call("rbind", vils)
+nnvi_mean <- aggregate(Importance~Variable, data=vidf, FUN=mean)
+nnvi_mean <- nnvi_mean[order(nnvi_mean$Importance, decreasing=TRUE), ]
+nnvi_mean$MODELTYPE <- "NN"
+nnvi_mean$Importance <- nnvi_mean$Importance*100 # all the others are scaled to 100
+
+vi_means <- rbind(lmvi_mean, glmvi_mean, rfvi_mean, nnvi_mean)
+vi_means$Variable <- factor(vi_means$Variable, levels = nnvi_mean$Variable[order(nnvi_mean$Importance, decreasing=FALSE)])
+vi_means$MODELTYPE <- factor(vi_means$MODELTYPE, levels=c("LM", "GLM", "RF", "NN"))
+
+MODELTYPE_labels <- c("LM", "GLM", "RF", "NN")
+names(MODELTYPE_labels) <- c("LM", "GLM", "RF", "NN")
+var_labels <- c("Date","Basin ID", "Basin Name", "River Basin", "County", "Operator", "Station Above #1", "Station Above #2", "Station Above #3", "Station Above #4", "Hierarchy", "Lon", "Lat", "Month", "Ordinal Month", "Season", "Year", "Water Year", "Temperature", "Tmp Lag 1d", "Tmp Lag 2d", "Tmp Lag 3d", "Precipitation", "Ppt Lag 1d", "Ppt Lag 2d", "Ppt Lag 3d", "Snow", "Drainage Area", "Shape", "Compactness", "Mean Elevation", "Relief Ratio", "Sat. Hyd. Conductivity", "% Silt", "% Sand", "% Clay", "Avail. Water Cont.", "Lambda Pore Size", "N Pore Size", "Depth to Restricted Layer", "Percent Vegetated", "Unimpaired Flow" )
+names(var_labels) <- c("DATE", "CDEC_ID", "STATION_NAME", "RIVER_BASIN", "COUNTY", "OPERATOR", "STATIONS_ABOVE1",  "STATIONS_ABOVE2", "STATIONS_ABOVE3", "STATIONS_ABOVE4", "HIERARCHY", "LONGITUDE", "LATITUDE", "MONTH", "MONTH_ORDINAL", "SEASON", "YEAR", "WATERYEAR", "TMP", "TMPLAG1", "TMPLAG2", "TMPLAG3", "PPT", "PPTLAG1", "PPTLAG2", "PPTLAG3", "SNOW", "AREASQM", "SHAPE", "COMPACTNESS", "MEANELEV", "BASINRELIEFRATIO","KSAT", "SILT", "SAND", "CLAY", "AWC", "LAMBDA", "N", "RESDT", "VEGETATED", "FLOW")
+
+png("Output Data/rplot51_vip_means.png", width=6.5, height=4, units="in", pointsize=8, res=1200)
+  ggplot(data=vi_means, aes(x=Importance, y=Variable, group=MODELTYPE)) +
+    geom_point(aes(shape=MODELTYPE, color=MODELTYPE), size=2)+
+    scale_color_manual(values=cbpblack[c(2, 3, 5, 6)], labels=MODELTYPE_labels)+
+    scale_shape_manual(values=c(3, 17, 0, 16), labels=MODELTYPE_labels)+
+    scale_y_discrete(labels=var_labels)+
+    labs(x="Importance (scaled)", y="")+
+    guides(shape = guide_legend(nrow = 1))+
+    theme_bw(base_size = 8)+
+    theme(legend.position="right", legend.title = element_blank()) 
+dev.off()
+```
+
+## 6.9 Partial Dependence Plots
+```{r pdp}
+library(pdp)
+pdp_AREASQM <- pdp_PPT <- list()
+nnmodel <- list()
+pdp_wrapper <- function(object, newdata) {
+  predict(object, x = as.matrix(newdata)) %>%
+    as.vector() %>%
+    mean()  # aggregate ICE curves
+}
+
+# pdp_AREASQM_PPT <- pdp_MONTH <- list()
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   testset <- moddf[moddf$CDEC_ID==h,]
+#   trainset <- moddf[moddf$CDEC_ID!=h,]
+#   testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+#   trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+#   testsetrv <- as.matrix(testset$FLOW)
+#   trainsetrv <- as.matrix(trainset$FLOW)
+# 
+#   modfilename <- paste0("Output Data/vi_models/nn_hdf5/nn_", h, ".h5")
+#   nnmodel[[k]] <- load_model_hdf5(modfilename, compile=FALSE)
+
+  # pdp_AREASQM[[k]] <- partial(nnmodel[[k]], pred.var = "AREASQM", pred.fun = pred_wrapper, train = as.data.frame(trainsetpvs))
+  # pdp_PPT[[k]] <- partial(nnmodel[[k]], pred.var = "PPT", pred.fun = pred_wrapper, train = as.data.frame(trainsetpvs))
+  # pdp_AREASQM_PPT[[k]] <- partial(nnmodel[[k]], pred.var = c("AREASQM", "PPT"), chull = TRUE, pred.fun = pdp_wrapper, train = as.data.frame(trainsetpvs))
+  # pdp_MONTH[[k]] <- partial(nnmodel[[k]], pred.var = "MONTH_ORDINAL", chull = TRUE, pred.fun = pdp_wrapper, train = as.data.frame(trainsetpvs))
+# }
+# 
+## took too long to run, especially the joint partial dependence so save and read back in
+# saveRDS(pdp_AREASQM, "ch2 data transformations/outputdata/pd_saved/nn_pdp_AREASQM.RDS")
+# saveRDS(pdp_PPT, "ch2 data transformations/outputdata/pd_saved/nn_pdp_PPT.RDS")
+# saveRDS(pdp_AREASQM_PPT, "ch2 data transformations/outputdata/pd_saved/nn_pdp_AREASQM_PPT.RDS")
+# saveRDS(pdp_MONTH, "ch2 data transformations/outputdata/pd_saved/nn_pdp_MONTH.RDS")
+
+# pdp_AREASQM <- readRDS("ch2 data transformations/outputdata/pd_saved/nn_pdp_AREASQM.RDS")
+# pdp_PPT <- readRDS("ch2 data transformations/outputdata/pd_saved/nn_pdp_PPT.RDS")
+# pdp_AREASQM_PPT <- readRDS("ch2 data transformations/outputdata/pd_saved/nn_pdp_AREASQM_PPT.RDS")
+# pdp_MONTH <- readRDS("ch2 data transformations/outputdata/pd_saved/nn_pdp_MONTH.RDS")
+
+# # randomly sampled because it was taking too long to plot
+# for(k in 1:(length(unique(moddf$CDEC_ID)))){
+#   h <- unique(moddf$CDEC_ID)[k]
+#   # p1 <- pdp_AREASQM[[k]][sample(nrow(pdp_AREASQM[[k]]), 50000),]  %>% autoplot(alpha = 0.1) + 
+#   #   labs(x="Drainage Area (km^2)", y="Predicted Unimpaired Flow (AF)") +
+#   #   theme_bw()
+#   # p2 <- pdp_PPT[[k]][sample(nrow(pdp_PPT[[k]]), 50000),] %>% autoplot(alpha = 0.1) + 
+#   #   labs(x="Precipitation (mm)", y="Predicted Unimpaired Flow (AF)") +
+#   #   theme_bw()
+#   # p3 <-  pdp_AREASQM_PPT[[k]] %>% autoplot() + 
+#   #   labs(x="Drainage Area (km^2)", y="Precipitation (mm)") +
+#   #   guides(fill=guide_legend(title="Predicted \nUnimpaired \nFlow (AF)"))
+#   #   theme_bw()
+#   p4 <-  ggplot(pdp_MONTH[[k]], aes(x=MONTH_ORDINAL, y=yhat))+
+#       geom_point()+
+#       labs(x="Ordinal Month (Distance From June)", y="Predicted Unimpaired Flow (AF/m)")+
+#       theme_bw()
+#   
+#   # png(paste0("ch2 data transformations/outputdata/pdp/nn/pdp1_testset_",h, ".png"), width=6.5, height=3, units="in", pointsize=8, res=1200)
+#   #   grid.arrange(p1, p2, ncol = 2)+
+#   #     theme_bw()
+#   # dev.off()
+#   # 
+#   # png(paste0("ch2 data transformations/outputdata/pdp/nn/pdp2_testset_",h, ".png"), width=6.5, height=3, units="in", pointsize=8, res=1200)
+#   #   print(p3)
+#   # dev.off()
+#   #
+#   png(paste0("ch2 data transformations/outputdata/pdp/nn/pdp3_testset_",h, ".png"), width=6.5, height=3, units="in", pointsize=8, res=1200)
+#     print(p4)
+#   dev.off()
+# }
+
+# # to customize 
+# print(pdp_AREASQM[[1]][sample(nrow(pdp_AREASQM[[1]]), 5000),] 
+#       %>% autoplot(alpha = 0.1)) +
+#       labs(x="Drainage Area (SQM)", y="Predicted Unimpaired Flow (AF/m)")+
+#       theme_bw()
+# 
+# print(pdp_PPT[[1]][sample(nrow(pdp_PPT[[1]]), 5000),] 
+#       %>% autoplot(alpha = 0.1)) +
+#       labs(x="Precipitation (mm)", y="Predicted Unimpaired Flow (AF/m)")+
+#       theme_bw()
+# 
+# print(pdp_MONTH[[1]] 
+#       %>% autoplot(alpha = 1)) +
+#       labs(x="Ordinal Month (distance from June)", y="Predicted Unimpaired Flow (AF/m)")+
+#       theme_bw()
+# 
+# ggplot(pdp_MONTH[[1]], aes(x=MONTH_ORDINAL, y=yhat))+
+#   geom_point()+
+#   labs(x="Ordinal Month (Distance From June)", y="Predicted Unimpaired Flow (AF/m)")+
+#   theme_bw()
+
+# for all predictor variables but for one basin, let's go with SJF
+testset <- moddf[moddf$CDEC_ID=="SJF",]
+trainset <- moddf[moddf$CDEC_ID!="SJF",]
+testsetpvs <- as.matrix(testset[,c(10,13:(ncol(testset)-1))])
+trainsetpvs <- as.matrix(trainset[,c(10,13:(ncol(trainset)-1))])
+testsetrv <- as.matrix(testset$FLOW)
+trainsetrv <- as.matrix(trainset$FLOW)
+
+# mean-standard deviation normalization. Note that testset is centered by trainset mean and sd (no leakage)!
+trainmean <- apply(trainsetpvs, 2, mean)
+trainsd <- apply(trainsetpvs, 2, sd)
+trainsetpvs <- sweep(sweep(trainsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+testsetpvs <- sweep(sweep(testsetpvs, 2L, trainmean, FUN="-"), 2, trainsd, FUN="/")
+
+# read model in
+nnmodel <- load_model_hdf5("Output Data/vi_models/nn_hdf5/nn_SJF.h5", compile=FALSE)
+
+p_vars <- colnames(trainset)[c(10,13:(ncol(trainset)-1))]
+var_labels <- c("Date","Basin ID", "Basin Name", "River Basin", "County", "Operator", "Station Above #1", "Station Above #2", "Station Above #3", "Station Above #4", "Hierarchy", "Lon", "Lat", "Month", "Ordinal Month (Distance from June)", "Season", "Year", "Water Year", "Temperature (Deg C)", "Temperature Lag 1d (Deg C)", "Temperature Lag 2d (Deg C)", "Temperature Lag 3d (Deg C)", "Precipitation (mm)", "Precipitation Lag 1d (mm)", "Precipitation Lag 2d (mm)", "Precipitation Lag 3d (mm)", "Snow (mm)", "Drainage Area (SQM)", "Shape (m/m)", "Compactness (m^2/m^2)", "Mean Elevation (m)", "Relief Ratio (m/m)", "Sat. Hyd. Conductivity (cm/hr)", "% Silt (%)", "% Sand (%)", "% Clay (%)", "Available Water Content (m^3/m^3)", "Lambda, Pore Size Distribution Index", "N, Pore Size Distribution", "Depth to Restricted Layer (cm)", "Percent Vegetated (%)", "Unimpaired Flow (AF/m)" )
+names(var_labels) <- c("DATE", "CDEC_ID", "STATION_NAME", "RIVER_BASIN", "COUNTY", "OPERATOR", "STATIONS_ABOVE1",  "STATIONS_ABOVE2", "STATIONS_ABOVE3", "STATIONS_ABOVE4", "HIERARCHY", "LONGITUDE", "LATITUDE", "MONTH", "MONTH_ORDINAL", "SEASON", "YEAR", "WATERYEAR", "TMP", "TMPLAG1", "TMPLAG2", "TMPLAG3", "PPT", "PPTLAG1", "PPTLAG2", "PPTLAG3", "SNOW", "AREASQM", "SHAPE", "COMPACTNESS", "MEANELEV", "BASINRELIEFRATIO","KSAT", "SILT", "SAND", "CLAY", "AWC", "LAMBDA", "N", "RESDT", "VEGETATED", "FLOW")
+
+# # for SJF
+# ice <- list()
+# for (i in 1:length(p_vars)){
+#   ice[[i]] <- partial(nnmodel, pred.var=p_vars[i], pred.fun=pred_wrapper, train=as.data.frame(trainsetpvs), ice=TRUE, nsim=100)
+# }
+# 
+# for (i in 1:length(p_vars)){
+#   plottoprint <- autoplot(ice[[i]][sample(nrow(ice[[i]]), 50000), ], alpha = 0.05) + 
+#     labs(x=var_labels[which(names(var_labels)==p_vars[i])], y="Predicted Unimpaired Flow (CFS)") +
+#     theme_bw()
+#   png(paste0("Output Data/pdp/nn_SJF/pdp_", p_vars[i], ".png"), width=6.5/2, height=2.25, units="in", pointsize=8, res=300)
+#     print(plottoprint)
+#   dev.off()
+# }
+
+# plot for paper
+# "AREASQM"   12
+# "MEANELEV"  15
+# "PPT"       7 
+# "TMP"       3
+# "SNOW"      11
+# "SAND"      19
+
+# make a long format data with the variables above
+vars_of_interest <- c(12, 15, 7, 3, 11, 19)
+ice <- list()
+for (i in seq_along(vars_of_interest)){
+  ice[[i]] <- partial(nnmodel, pred.var=p_vars[vars_of_interest[i]], pred.fun=pred_wrapper, train=as.data.frame(trainsetpvs), ice=TRUE, nsim=100)
+  ice[[i]]$VAR <- colnames(ice[[i]])[1]
+  colnames(ice[[i]]) <- c("VALUE", "PRED", "ID", "VAR")
+}
+
+ice_SJF <- do.call("rbind", ice)
+ice_SJF$VAR <- factor(ice_SJF$VAR, levels=c("AREASQM", "PPT", "TMP", "SNOW", "MEANELEV", "SAND"))
+pretty_facet_labels <- var_labels[c(28, 31, 23, 19, 27, 35)]
+
+library(ggpmisc)
+png('Output Data/rplot52_pdp.png', width=6.5, height=6.5, units="in", pointsize=8, res=300)
+  plottoprint <- ggplot(ice_SJF, aes(x=VALUE, y=PRED)) +
+    geom_line(aes(group=ID), alpha = 0.05) +
+    facet_wrap(~VAR, ncol=2, scales = "free_x", strip.position = "top", labeller=labeller(VAR=pretty_facet_labels))+
+    labs(x="", y = "Predicted Unimpaired Flow (AF/m)", color = "")+
+    theme(legend.text=element_text(size=10), text=element_text(size=10))+
+    stat_summary(fun = mean, geom = "line", col=cbpblack[8])+
+    theme_bw(base_size = 8)
+  print(plottoprint)
+dev.off()
 ```
 
