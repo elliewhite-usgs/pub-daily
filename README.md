@@ -7,7 +7,7 @@ Install R and Rstudio. Clone or donwload this repository. Open Rstudio and creat
 install.packages("ratser")
 ```
 
-No GPU is required for running keras and training neural networks.
+No GPU is required for running keras and training neural networks, although one would be very helpful. Most models now take 10-18 hrs to run without a GPU.
 
 ## Usage 
 All code used to process data and for modelling is in \*.Rmd files. 
@@ -28,10 +28,16 @@ Once moddf.rds is made from running "ch1 data prep.Rmd", other \*.Rmd files can 
 Email me at white.elaheh@gmail.com. 
 
 ## Roadmap 
+This work includes: 
+1) data processed for 19 California basins where unimpaired flows have been constructed. 
+2) record of how to build LM, GLM, RF, and NN models. The NN models include: a sequential model where sequences are in time and for each basin, a sequential model where sequences are only in time, LSTM models where sequences are across a rolling window. 
+3) various loss functions applied to NN models 
+4) various resampling strategies used to evaluate model error. 
+
 Future work can improve predictions by: 
-1) including more basins in the study to give more diversity in basin characteristics.
+1) including more basins in the study to give more diversity in basin characteristics. These can come from process based (PB) models.
 2) adding more predictor variables to the data: e.g., min and max temperature, solar radiation, and vapor pressure, average seasonal precipitations, average annual temperatures, precent coniferous or coniferous/deciduous land cover, cumulative monthly (or weekly) precipitation.  
-3) changing the neural network architecture to include many basin observations as inputs (although this may be tricky with predicting one basin at a time in the LOGO cross validation method) and include a LSTM to take into account the sequential nature of the observations. 
+3) optimizing LSTM model parameters. 
 4) including network information with a more sophisticated model suited to handling network flow data (e.g., traffic prediciton models). 
 
 ## Project Status 
