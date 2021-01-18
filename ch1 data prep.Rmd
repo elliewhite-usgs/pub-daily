@@ -99,24 +99,24 @@ Modifications: need to aggregate by basin
 
 ```{r prism_data}
 library(prism)
-# set the path to download temperature data
-options(prism.path = "Input Data/PRISM_TMP")
+# # set the path to download temperature data
+# options(prism.path = "Input Data/PRISM_TMP")
 
 # uncomment to download data if not in the directory set above
 # # daily data covers 1 Jan 1981 to 30 Jun 2015, I downloaded 2000-01-01 to 2015-06-30
 # get_prism_dailys(type = "tmean", minDate = "2003-03-09", maxDate= "2010-01-01", keepZip = FALSE)
 
-# create a stack of prism files to use for processing later
-prism_tmp <- prism_stack(ls_prism_data()[, 1])
+# # create a stack of prism files to use for processing later
+# prism_tmp <- prism_stack(ls_prism_data()[, 1])
 
-# set the path to download precipitation data
-options(prism.path = "Input Data/PRISM_PPT")
+# # set the path to download precipitation data
+# options(prism.path = "Input Data/PRISM_PPT")
 
 # # uncomment to download data if not in the directory set above
 # get_prism_dailys(type = "ppt", minDate = "2000-01-01", maxDate= "2010-01-01", keepZip = FALSE)
 
-# create a stack of prism files to use for processing later
-prism_ppt <- prism_stack(ls_prism_data()[, 1])
+# # create a stack of prism files to use for processing later
+# prism_ppt <- prism_stack(ls_prism_data()[, 1])
 ```
 
 ```{r prism_aggregation}
@@ -814,15 +814,40 @@ dput(names(moddf))
 moddf <- moddf[, c("DATE", "CDEC_ID", "STATION", "RIVER_BASIN", "COUNTY", "OPERATOR", "LONGITUDE", "LATITUDE", "MONTH", "MONTH_ORDINAL", "SEASON", "YEAR", "WATERYEAR", "TMP", "TMPLAG1", "TMPLAG2", "TMPLAG3", "PPT", "PPTLAG1", "PPTLAG2", "PPTLAG3", "SNOW", "AREASQM", "SHAPE", "COMPACTNESS", "MEANELEV", "BASINRELIEFRATIO", "KSAT", "SILT", "SAND", "CLAY", "AWC", "LAMBDA", "N", "RESDT", "VEGETATED", "FLOW")]
 ```
 
-```{r final_touches}
-# get rid of NAs: 431 total; lots of times in NHG, and 2000-10-08	WHI, 2000-12-09	WHI, 2001-05-26	YRS, 2011-01-21	YRS, 2011-10-21	YRS. Make them 0s. 
+```{r na_neg_flows}
+# first, let's plot where the NAs and negative flows are happenning
 df_nas <- moddf[is.na(moddf$FLOW),]
+df_negf <- moddf[moddf$FLOW<0, ]
+
+# plot 
+df_nas_count <- aggregate(VEGETATED~CDEC_ID, df_nas, FUN="length")
+df_negf_count <- aggregate(VEGETATED~CDEC_ID, df_negf, FUN="length")
+
+library(naniar)
+
+cbpwhite <-  c("#FFFFFF", "#CC79A7",  "#E69F00", "#F0E442", "#009E73", "#0072B2", "#D55E00", "#56B4E9")
+for(i in seq_along(df_negf_count$CDEC_ID)){
+  h <- df_negf_count$CDEC_ID[i]
+  png(paste0('Output Data/flow_vis/rplot11_flows_',h ,'.png'), width=6.5, height=4, units="in", pointsize=8, res=300)
+    plottoprint <- ggplot(moddf[moddf$CDEC_ID==h,], aes(x = DATE, y = FLOW)) +
+    geom_miss_point(alpha=0.5) +
+    geom_point(aes(color=ifelse(FLOW>0, "Unimpaired Flows", "Negative Flows")), alpha=0.5) +
+    scale_colour_manual(breaks= c("Unimpaired Flows", "Not Missing", "Negative Flows", "Missing"), labels = c("Unimpaired Flows", "Not Missing", "Negative Flows", "Missing"), values=cbpwhite[c(8, 1, 7, 3)])+
+    labs(color="", x="", y="Unimpaired Flow (CFS)") +
+    theme_bw()
+    print(plottoprint)
+  dev.off()
+}
+
+  
+# get rid of NAs: lots of times in NHG, and 2000-10-08	WHI, 2000-12-09	WHI, 2001-05-26	YRS, 2011-01-21	YRS, 2011-10-21	YRS. Make them 0s. 
 moddf$FLOW <- ifelse(is.na(moddf$FLOW), 0, moddf$FLOW)
 
 # get rid of negative flows: 2675 in this dataset
-df_negf <- moddf[moddf$FLOW<0, ]
 moddf$FLOW <- ifelse(moddf$FLOW<0, 0, moddf$FLOW)
+```
 
+```{r final_touches}
 summary(moddf)
 
 # are they all the same size? WHI was missing observations...

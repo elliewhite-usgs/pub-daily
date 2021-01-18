@@ -296,4 +296,37 @@ png('Output Data/rplot211_map.png', width=3.25, height=5, units="in", pointsize=
   plot(sptdf, col='darkblue', add=TRUE, pch=20)
   text(sptdf, labels=as.character(sptdf@data$CDEC_ID), col="darkblue", cex=0.5, offset=0.25, pos=4)
 dev.off()
+
+# make a prettier map
+# bring in the non-transformed data 
+df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
+sptdf <- df
+
+# keep df as a normal DataFrame for later use, and make spdf a SpatialPolygonsDataFrame
+coordinates(sptdf) <- ~LONGITUDE + LATITUDE
+proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
+
+library(rgdal)
+basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily2.shp')
+caboundary <-  shapefile('Input Data/CA_BOUNDARIES/CA_State_TIGER2016.shp')
+cacounties <- shapefile("Input Data/CA_BOUNDARIES/CA_Counties_TIGER2016.shp")
+cacounties <- spTransform(cacounties, CRS("+proj=longlat"))
+
+# got to google cloud to set up account/API key: https://console.cloud.google.com
+library(ggmap)
+library(ggsn) # for north arrow and scalebar
+ggmap::register_google(key = "")
+ca_basemap <- get_map(location=c(lon = -120.525, lat = 38.70293), zoom=6, maptype = 'terrain-background', source = 'stamen')
+
+png('Output Data/rplot211_map.png', width=3.25, height=5, units="in", pointsize=10, res=300)
+ggmap(ca_basemap, extent = "device", maprange = FALSE)+ 
+  geom_polygon(data=fortify(cacounties), aes(long, lat, group = group), fill = "gray88", colour = "grey95", alpha = 0.2) +
+  geom_polygon(data=fortify(basins), aes(long, lat, group = group), fill = "lightslategrey", colour = "white", alpha = 0.8) +
+  geom_point(data=as.data.frame(sptdf), aes(x = LONGITUDE, y = LATITUDE), colour = "darkblue")+
+  geom_text(data=as.data.frame(sptdf), aes(x = LONGITUDE, y = LATITUDE, label=CDEC_ID), colour = "darkblue", size=2, hjust=-0.5)+ 
+  theme_bw() +
+  theme(legend.position="none")+
+  scale_x_continuous(limits = c(-124, -117), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(35, 42), expand = c(0, 0)) 
+dev.off()
 ```
