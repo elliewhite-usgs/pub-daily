@@ -61,16 +61,16 @@ library(raster)
 # CDEC Basin locations
 df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
 
-# # subset to get the basins of interest, let's keep them all this time
+# # uncomment to subset the basins to be just the ones in the sac delta (9)
 # df <- df[df$IN_SAC_DELTA==1,]
-sptdf <- df
 
 # keep df as a normal DataFrame for later use, and make spdf a SpatialPolygonsDataFrame
+sptdf <- df
 coordinates(sptdf) <- ~LONGITUDE + LATITUDE
 proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
 
-library(rgdal)
 # basin boundaries
+library(rgdal)
 basins <- shapefile('Input Data/CDEC_FNF/Catchment_all_daily2.shp')
 
 # projections that are appropriate for California
@@ -120,7 +120,7 @@ library(prism)
 ```
 
 ```{r prism_aggregation}
-# # aggregate temp and precip rasters by basin boundaries, this function takes a long time and is an "embarrassingly parallel problem"
+# # aggregate temp and precip rasters by basin boundaries, this function takes a long time and is an "embarrassingly parallel problem", so...
 # basins_inc_tmp <- extract(prism_tmp, basins, fun=mean,  weights=FALSE, small=TRUE)
 # basins_inc_ppt <- extract(prism_ppt, basins, fun=mean,  weights=FALSE, small=TRUE)
 
@@ -838,12 +838,11 @@ for(i in seq_along(df_negf_count$CDEC_ID)){
     print(plottoprint)
   dev.off()
 }
-
   
-# get rid of NAs: lots of times in NHG, and 2000-10-08	WHI, 2000-12-09	WHI, 2001-05-26	YRS, 2011-01-21	YRS, 2011-10-21	YRS. Make them 0s. 
+# get rid of NAs, make them 0
 moddf$FLOW <- ifelse(is.na(moddf$FLOW), 0, moddf$FLOW)
 
-# get rid of negative flows: 2675 in this dataset
+# get rid of negative flows, make them 0
 moddf$FLOW <- ifelse(moddf$FLOW<0, 0, moddf$FLOW)
 ```
 

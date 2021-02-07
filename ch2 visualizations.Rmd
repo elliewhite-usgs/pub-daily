@@ -50,10 +50,7 @@ cacounties <- spTransform(cacounties, albers)
 # join the information on the stations to the SpatialPolygonsDataFrame
 basins@data <- merge(basins@data, sptdf, by="CDEC_ID")
 
-# basins_agg <- basins[1:(which(basins$CDEC_ID=="AMA_INC")[1]-1), ]
-# basins_inc <- basins[which(basins$CDEC_ID=="AMA_INC")[1]:nrow(basins), ]
-
-# print a summary table for appendix A
+# print a summary table
 library(xtable)
 tbl_appa <- basins@data[, c("CDEC_ID", "STATION", "RIVER_BASIN", "COUNTY", "ELEV_FT", "OPERATOR", "LONGITUDE", "LATITUDE")]
 rownames(tbl_appa) <- 1:dim(tbl_appa)[1]
@@ -93,10 +90,6 @@ cols[moddf$FLOW >= mean(moddf$FLOW)] <- cbpblack[8]
 cols[moddf$FLOW < mean(moddf$FLOW)] <- cbpblack[3]
 
 plot(moddf$FLOW, main="Observed Response Data", ylab="Unimpaired Flow (cfs)", col=cols)
-
-# library(tabplot)
-# tableplot(moddf[,c(1:14, ncol(moddf))], sortCol="CDEC_ID")
-# tableplot(moddf[,c(1:2, 15:ncol(moddf))], sortCol="CDEC_ID") 
 ```
 
 ## 2.2 1D Plots
@@ -111,13 +104,6 @@ png('Output Data/rplot21_flowcdf.png', width=3.25, height=3, units="in", pointsi
   mtext(text='Percentiles for Unimpaired Flow', side=2, line=2)
   mtext(text='Sorted Unimpaired Flow (cfs)', side=1, line=2)
 dev.off()
-
-# # or use this method for plotting the Empirical Cumluative Distribution
-# flow_ordered <- sort(moddf$FLOW)
-# n <- sum(!is.na(moddf$FLOW))
-# # notice the option type = 's' for plotting the step functions
-# plot(flow_ordered, (1:n)/n, type = 's', ylim = c(0, 1), xlab = 'Sorted Monthly Unimpaired Flow', ylab = '', main = '', xlim=c(0.1,max(moddf$FLOW)), log='x')
-# mtext(text = expression(hat(F)[n](x)), side = 2, line = 2.5)
 
 png('Output Data/rplot21_flowcdf2.png', width=3.25, height=3, units="in", pointsize=8, res=300)
 par(mar=c(4,4.5,1,1)+0.1)
@@ -268,7 +254,7 @@ png('Output Data/rplot210_corrwithflow.png', width=3.25, height=3, units="in", p
   text(x=corrdf[1:nrow(corrdf),2], y=1:nrow(corrdf), labels=round(corrdf[1:nrow(corrdf),2],2), pos=4, cex=0.7)
 dev.off()
 
-# In R, there are several packages for getting the partial correlation coefficients along with the t- test for checking their significance level. Use the package to compute the partial correlation coefficients along with the t-statistic and corresponding p-values.corpcor had a better way of calculating the partial correlations without so many errors in the covariance matrix not being positive definite and being singular.
+# In R, there are several packages for getting the partial correlation coefficients along with the t- test for checking their significance level. Use the package to compute the partial correlation coefficients along with the t-statistic and corresponding p-values. corpcor had a better way of calculating the partial correlations without so many errors in the covariance matrix not being positive definite and being singular.
 
 library(corpcor) # cor2pcor computes the pairwise partial correlation coefficients from either a correlation or a covariance matrix
 png('Output Data/rplot210_partialcorrwithflow.png', width=3.5, height=3, units="in", pointsize=8, res=300)

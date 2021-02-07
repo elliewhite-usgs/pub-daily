@@ -11,7 +11,7 @@ Record of how a model will behave given different loss functions on hydrologic d
 1.0 Data Gathering
 2.0 Data Transformations
 3.0 Functions
-4.0 Modelling and Resampling
+4.0 Modeling and Resampling
 5.0 LOGO Post Processing
   5.1 Aggregate Basins
   5.1 GOF Post Processing
@@ -62,7 +62,7 @@ moddf <- readRDS('Intermediary Data/moddf.rds')
 # some helpful dataframes, may come in handy later for post processing
 sptdf <- df <- read.csv("Input Data/CDEC_FNF/station_search.csv", header=TRUE, stringsAsFactors=FALSE, fileEncoding="UTF-8-BOM")
 
-# sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,] no longer ommiting other basins from the study
+# sptdf <- sptdf[sptdf$IN_SAC_DELTA==1,] no longer omitting basins from the study
 
 coordinates(sptdf) <- ~LONGITUDE + LATITUDE
 proj4string(sptdf) <- CRS('+proj=longlat +datum=WGS84')
@@ -211,7 +211,7 @@ linexe_wrapper_stochastic <- custom_metric("linexe", function(y_true, y_pred){
 
 # need to write a wlse_wrapper_minibatch function if you want to speed up training. For now just use long epochs. 
 
-# these experiments get funky when standradizing the data. I suspect it is because we want to keep the information of the distributions in, when fitting to different parts of it. Go back to relu activations without standardizing. 
+# these experiments get funky when standardizing the data. I suspect it is because we want to keep the information of the distributions in, when fitting to different parts of it. Go back to relu activations without standardizing. 
 nnloss <- function(data, losstype){
   optimmodel <- results <- modgof <- list()
   

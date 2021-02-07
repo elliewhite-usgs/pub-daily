@@ -124,7 +124,7 @@ search()
 
 ## 4.1 LM
 ```{r lm_modelling_and_cv}
-# groupingstyle can be: resub, 2L, 5L, 10L, logo, lmgo, lho. Notice how a plain 2, 5, and 10 will not work, you have to declare it an integer
+# groupingstyle can be: resub, 2L, 5L, 10L, logo, lmgo. Notice how a plain 2, 5, and 10 will not work, you have to declare it an integer
 
 library(dismo)
 lmcv <- function(data, groupingstyle){
@@ -299,7 +299,7 @@ glmcv <- function(data, groupingstyle, datatype){
     rownames(modgof) <- names_tbd
   }
   
-  # # for leave hierarchies out cross validation
+  # # for leave hierarchies out cross validation, not trying this
   # if(groupingstyle=="lho"){
   # }
   
@@ -338,7 +338,7 @@ glmtwd_lmgo_results <- readRDS("Output Data/rds/glmtwd_lmgo_results.RDS")
 
 ## 4.3 RF
 ```{r rf_modelling_and_cv}
-# we are not saving the models because it takes too much memory. so rrfmodel is no longer specified as a list and took mod=rfmodel out of return list. 
+# we are not saving the models here because it takes too much memory. so rfmodel is no longer specified as a list and took mod=rfmodel out of return list. 
 
 library(randomForest)
 
@@ -682,7 +682,7 @@ Response $Y$ is a 3D matrix:
 2. # of timesteps to predict = 1 (the last one, many to one architecture) 
 3. # of target variables = 1 (flow)
 
-Use a rolling window to have more samples than just the number of basins. 
+Use a rolling window to connect observations. 
 Note: the parameters have not been optimized.
 
 ```{r lstm_modeling_and_cv}
@@ -877,7 +877,7 @@ lstmcv <- function(data, groupingstyle){
 ```
 
 ### 4.4.3 NN for Timeseries
-!!! NOT for PUB where the ungauged basin is in space. For PUB when there's a timeseries or a forecast that is of interest. 
+Here the input shape is different. Where the model sees data at a specific time for all the basins. So, here, hydrology is defined as a process that happens at 19 basins at once. Asking the model to predict one basin will no longer make sense. So, !!! NOT for PUB where the ungauged basin is in space. For PUB when there's a timeseries or a forecast that is of interest. 
 ```{r nn_different_architecture}
 nntcv <- function(data, groupingstyle){
   if(groupingstyle=="logo"){
@@ -1073,10 +1073,6 @@ results <- pp_results(nns_5fold_results, results, "nn", 5L)
 results <- pp_results(nns_10fold_results, results, "nn", 10L)
 results <- pp_results(nns_logo_results, results, "nn", "logo")
 results <- pp_results(nns_lmgo_results, results, "nn", "lmgo")
-
-# ncells <- 5
-# results <- pp_results(lstm_logo_results, results, "lstm", "logo")
-# results <- pp_results(lstm_lmgo_results, results, "lstm", "lmgo")
 ```
 
 ## 5.2 GOF Post Processing
@@ -1277,16 +1273,13 @@ mastercv_lm <- results[,c("CDEC_ID", "FLOW", "LM_RESUBFIT", "LM_2FOLDFIT", "LM_5
 mastercv_glm <- results[,c ("CDEC_ID", "FLOW", "GLM_RESUBFIT", "GLM_2FOLDFIT", "GLM_5FOLDFIT", "GLM_10FOLDFIT", "GLM_LOGOFIT", "GLM_LMGOFIT")]
 mastercv_rf <- results[,c("CDEC_ID","FLOW", "RF_RESUBFIT", "RF_2FOLDFIT", "RF_5FOLDFIT", "RF_10FOLDFIT", "RF_LOGOFIT", "RF_LMGOFIT")]
 mastercv_nn <- results[,c("CDEC_ID", "FLOW", "NN_RESUBFIT", "NN_2FOLDFIT", "NN_5FOLDFIT", "NN_10FOLDFIT", "NN_LOGOFIT", "NN_LMGOFIT")]
-# mastercv_lstm <- results[,c("CDEC_ID", "FLOW", "LSTM_LOGOFIT", "LSTM_LMGOFIT")]
 
 mastercv_lm$MODELTYPE <- "LM"
 mastercv_glm$MODELTYPE <- "GLM"
 mastercv_rf$MODELTYPE <- "RF"
 mastercv_nn$MODELTYPE <- "NN"
-# mastercv_lstm$MODELTYPE <- "LSTM"
 
 colnames(mastercv_lm)[1:8] <- colnames(mastercv_glm)[1:8] <- colnames(mastercv_rf)[1:8] <- colnames(mastercv_nn)[1:8] <- c("CDEC_ID", "OBS", "RESUB", "2FOLD", "5FOLD", "10FOLD", "LOGO", "LMGO")
-# colnames(mastercv_lstm) <- c("CDEC_ID", "OBS", "LOGO", "LMGO", "MODELTYPE") 
 
 # just do NN for now, so don't join
 # master_cv <- rbind(mastercv_lm, mastercv_glm, mastercv_rf, mastercv_nn, mastercv_lstm)
@@ -1314,31 +1307,6 @@ png('Output Data/rplot43_obsvspred_all_nn.png', width=6.5, height=8, units="in",
     theme_bw(base_size = 8)
   print(plottoprint)
 dev.off()
-
-# # just do logo and lmgo for nn and lstm 
-# master_cv <- rbind(mastercv_nn[, c("CDEC_ID", "OBS", "LOGO", "LMGO", "MODELTYPE")], mastercv_lstm)
-# master_cv_melted <- melt(master_cv, measure.vars= c("LOGO", "LMGO"), variable.name="GROUPINGSTYLE", value.name="PRED")
-# master_cv_melted$MODELTYPE <- factor(master_cv_melted$MODELTYPE, levels=c("NN", "LSTM"))
-# master_cv_melted$GROUPINGSTYLE <- factor(master_cv_melted$GROUPINGSTYLE, levels=c("LOGO", "LMGO"))
-# pretty_facet_labels <- c("Leave One Group Out (LOGO)", "Leave Multiple Groups Out (LMGO)")
-# names(pretty_facet_labels) <- c("LOGO", "LMGO")
-# 
-# png('Output Data/rplot43_obsvspred_logolmgo.png', width=6.5, height=6.5, units="in", pointsize=8, res=1200)
-#   plottoprint <- ggplot(master_cv_melted, aes(x=OBS, y=PRED)) +
-#     geom_point(aes(group=CDEC_ID, colour=CDEC_ID, shape=CDEC_ID)) +
-#     geom_smooth(method="lm", se=FALSE, color="black")+
-#     stat_poly_eq(formula = y ~ x, 
-#                 aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
-#                 parse = TRUE) +
-#     geom_abline(slope=1, intercept=0, color="black", linetype=3)+
-#     facet_wrap(~GROUPINGSTYLE+MODELTYPE, ncol=2, labeller=labeller(GROUPINGSTYLE=pretty_facet_labels))+
-#     scale_discrete_manual(aesthetics = "color", values=cbpblack, name="Basin")+
-#     scale_discrete_manual(aesthetics= "shape", values=c(1:19), name="Basin") +
-#     labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
-#     theme(legend.text=element_text(size=10), text=element_text(size=10))+
-#     theme_bw(base_size = 8)
-#   print(plottoprint)
-# dev.off()
 ```
 
 ## 6.3 Density Plots
@@ -1347,7 +1315,6 @@ mastercv_lm <- results[,c("FLOW", "LM_RESUBFIT", "LM_2FOLDFIT", "LM_5FOLDFIT", "
 mastercv_glm <- results[,c("FLOW", "GLM_RESUBFIT", "GLM_2FOLDFIT", "GLM_5FOLDFIT", "GLM_10FOLDFIT", "GLM_LOGOFIT", "GLM_LMGOFIT")]
 mastercv_rf <- results[,c("FLOW", "RF_RESUBFIT", "RF_2FOLDFIT", "RF_5FOLDFIT", "RF_10FOLDFIT", "RF_LOGOFIT", "RF_LMGOFIT")]
 mastercv_nn <- results[,c("FLOW", "NN_RESUBFIT", "NN_2FOLDFIT", "NN_5FOLDFIT", "NN_10FOLDFIT", "NN_LOGOFIT", "NN_LMGOFIT")]
-# mastercv_lstm <- results[,c("FLOW", "LSTM_LOGOFIT", "LSTM_LMGOFIT")]
 
 mastercv_lm$MODELTYPE <- "LM"
 mastercv_glm$MODELTYPE <- "GLM"
@@ -1425,7 +1392,6 @@ br2map <- function(gof_results, modelform, groupingstyle, datatype){
 # br2map(gof_nn_10fold_by_basins, "nn", "10fold", "agg")
 br2map(gof_nn_logo_by_basins, "nn", "logo", "agg")
 # br2map(gof_nn_lmgo_by_basins, "nn", "lmgo", "agg")
-# br2map(gof_lstm_logo_by_basins, "lstm", "logo", "agg")
 ```
 
 ## 6.5 Dotcharts
@@ -1573,13 +1539,9 @@ gofdotchart <- function(gof_results_resub, gof_results_2fold, gof_results_5fold,
 # gofdotchart(gof_glm_resub_by_basins, gof_glm_2fold_by_basins, gof_glm_5fold_by_basins, gof_glm_10fold_by_basins, gof_glm_logo_by_basins, gof_glm_lmgo_by_basins, "glm", "bR2")
 # gofdotchart(gof_rf_resub_by_basins, gof_rf_2fold_by_basins, gof_rf_5fold_by_basins, gof_rf_10fold_by_basins, gof_rf_logo_by_basins, gof_rf_lmgo_by_basins, "rf", "bR2")
 gofdotchart(gof_nn_resub_by_basins, gof_nn_2fold_by_basins, gof_nn_5fold_by_basins, gof_nn_10fold_by_basins, gof_nn_logo_by_basins, gof_nn_lmgo_by_basins, "nn", "bR2")
-# gofdotchart(gof_nn_resub_by_basins, gof_nn_2fold_by_basins, gof_nn_5fold_by_basins, gof_nn_10fold_by_basins, gof_lstm_logo_by_basins, gof_lstm_lmgo_by_basins, "lstm", "bR2")
 ```
 
-## 6.6 Boxplots
-consider adding a boxplot band on each of the mean points in the dotchart for the BS runs
-
-## 6.7 Time Series
+## 6.6 Time Series
 ```{r tsplots_comp}
 for (r in 1:(length(unique(results$CDEC_ID)))){ 
   # plot time series by basin
@@ -1710,9 +1672,9 @@ for (r in 1:(length(unique(results$CDEC_ID)))){
 }
 ```
 
-## 6.8 Variable Importance Plots 
+## 6.7 Variable Importance Plots 
 ```{r vip_prep}
-# the models need to be saved, so run the modeling again
+# the models need to be saved, so run the modeling again, these plots from here on out take a long time to process too! 
 
 # # NN
 # nfeat <- dim(moddf[,c(10,13:(ncol(moddf)-1))])[2]
@@ -1996,7 +1958,7 @@ png("Output Data/rplot51_vip_means.png", width=6.5, height=4, units="in", points
 dev.off()
 ```
 
-## 6.9 Partial Dependence Plots
+## 6.8 Partial Dependence Plots
 ```{r pdp}
 library(pdp)
 pdp_AREASQM <- pdp_PPT <- list()
@@ -2155,6 +2117,43 @@ png('Output Data/rplot52_pdp.png', width=6.5, height=6.5, units="in", pointsize=
     labs(x="", y = "Predicted Unimpaired Flow (AF/m)", color = "")+
     theme(legend.text=element_text(size=10), text=element_text(size=10))+
     stat_summary(fun = mean, geom = "line", col=cbpblack[8])+
+    theme_bw(base_size = 8)
+  print(plottoprint)
+dev.off()
+```
+
+## 6.9 Next Steps Plots
+```{r LSTM_plot}
+# remember results gets truncated by ncells for each basin
+ncells <- 3
+lstm_logo_results <- readRDS("Output Data/rds/lstm_logo_exp8_results.RDS")
+results <- pp_results(lstm_logo_results, results, "lstm", "logo")
+
+mastercv_lstm <- results[,c("CDEC_ID", "FLOW", "LSTM_LOGOFIT")]
+mastercv_lstm$MODELTYPE <- "LSTM"
+colnames(mastercv_lstm) <- c("CDEC_ID", "OBS", "LOGO", "MODELTYPE")
+  
+# just do logo nn and lstm
+master_cv <- rbind(mastercv_nn[, c("CDEC_ID", "OBS", "LOGO", "MODELTYPE")], mastercv_lstm)
+master_cv_melted <- melt(master_cv, measure.vars= c("LOGO"), variable.name="GROUPINGSTYLE", value.name="PRED")
+master_cv_melted$MODELTYPE <- factor(master_cv_melted$MODELTYPE, levels=c("NN", "LSTM"))
+master_cv_melted$GROUPINGSTYLE <- factor(master_cv_melted$GROUPINGSTYLE, levels=c("LOGO"))
+pretty_facet_labels <- c("Leave One Group Out (LOGO)")
+names(pretty_facet_labels) <- c("LOGO")
+
+png('Output Data/rplot43_obsvspred_logonnlstm.png', width=6.5, height=6.5/2, units="in", pointsize=8, res=300)
+  plottoprint <- ggplot(master_cv_melted, aes(x=OBS, y=PRED)) +
+    geom_point(aes(group=CDEC_ID, colour=CDEC_ID, shape=CDEC_ID)) +
+    geom_smooth(method="lm", se=FALSE, color="black")+
+    stat_poly_eq(formula = y ~ x,
+                aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")),
+                parse = TRUE) +
+    geom_abline(slope=1, intercept=0, color="black", linetype=3)+
+    facet_wrap(~GROUPINGSTYLE+MODELTYPE, ncol=2, labeller=labeller(GROUPINGSTYLE=pretty_facet_labels))+
+    scale_discrete_manual(aesthetics = "color", values=cbpblack, name="Basin")+
+    scale_discrete_manual(aesthetics= "shape", values=c(1:19), name="Basin") +
+    labs(x ="Observed Unimpaired Flow (cfs)", y = "Predicted Unimpaired Flow (cfs)", color = "")+
+    theme(legend.text=element_text(size=10), text=element_text(size=10))+
     theme_bw(base_size = 8)
   print(plottoprint)
 dev.off()
