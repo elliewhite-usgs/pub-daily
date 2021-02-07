@@ -22,6 +22,8 @@ The "Output Data" folder contains all plots from the code but is missing a "rds"
 
 Once moddf.rds is made from running "ch1 data prep.Rmd", other \*.Rmd files can be ran in what ever order is wanted. 
 
+functions.R and main.R were written for farming out just the modeling part to a Linux machine with better GPU processors (some of these models took days to train without it). 
+
 "ml overview.pptx" is a slideshow explaining the concepts behind modeling for PUB. 
 
 ## Support 
@@ -30,8 +32,8 @@ Email me at white.elaheh@gmail.com.
 ## Roadmap 
 This work includes: 
 1) data processed for 19 California basins where unimpaired flows have been constructed. 
-2) record of how to build LM, GLM, RF, and NN models. The NN models include: a sequential model where sequences are in time and for each basin, a sequential model where sequences are only in time, LSTM models where sequences are across a rolling window. 
-3) various loss functions applied to NN models 
+2) record of how to build LM, GLM, RF, and NN models. The NN models include: a sequential model where sequences are in time and for each basin, a sequential model where sequences are only in time, many-to-one LSTM models where sequences are across a rolling window. 
+3) various loss functions applied to NN models. 
 4) various resampling strategies used to evaluate model error. 
 
 Future work can improve predictions by: 
